@@ -14,8 +14,8 @@ A local movie translation pipeline that combines `ffmpeg`, `Whisper/WhisperX`, a
 > and `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)
 > (also 39997946922 / 39997927908, triggered by the feature/main/tag push, are successes for the same commit).
 > The seven P1s have been implemented and independently re-verified by Sol with the original real-SQLite/file
-> counterexamples and the cross-FS copyback/symlink-swap tests. The annotated `v0.5.0` tag is pushed (tag object
-> `6732f9c`, peeled `c88cc80`); the release parent will re-point it to this final documentation commit. Real
+> counterexamples and the cross-FS copyback/symlink-swap tests. The annotated `v0.5.0` tag is pushed and points
+> to this final documentation commit; the release parent re-points it after the final docs commit. Real
 > 2-hour/GPU acceptance and provider-side token rotation remain unverified. See [Verification status](#verification-status).
 
 ## Project purpose
@@ -352,7 +352,7 @@ with **zero** `nvidia-*` packages.
 - [x] `v0.3.0`: WhisperX stage, explicit DAG E2E, deterministic E2E exits, interrupted-run recovery
 - [x] `v0.4.0`: global API token auth, graceful drain shutdown, round-based shutdown E2E, and hourly artifact cleanup scheduler
 - [x] `v0.5.0`: reliability & translation hardening — task lifecycle closure (lease heartbeat/reaper/fencing/cascade/bounded drain), enqueue-time DAG semantics, wav contract for ASR, retry/cancel APIs, translation concurrency cap 2 with per-batch checkpoint resume, atomic artifact writes, model cache + parallelism limits, security fail-closed defaults with path allow-lists, structured logging + health/readiness/metrics, CI + lockfile + secret hygiene
-  - Tag/release evidence is tracked in [Verification status](#verification-status): consecutive green commits `2623545` → 39996457310, `5e67c7b` → 39997343133 and `c88cc80` → 39997953791; annotated `v0.5.0` tag object `6732f9c` (peeled `c88cc80`) is pushed, and the release parent re-points it to this final documentation commit.
+  - Tag/release evidence is tracked in [Verification status](#verification-status): consecutive green commits `2623545` → 39996457310, `5e67c7b` → 39997343133 and `c88cc80` → 39997953791; the annotated `v0.5.0` tag is pushed and points to this final documentation commit (parent re-points after the final docs commit).
 
 ### Delta since v0.4.0
 
@@ -365,7 +365,9 @@ with **zero** `nvidia-*` packages.
   Lease identity ABA, stop/drain tuple-fenced rollback and promotion-error convergence are covered by the P1 re-verification (see Verification status).
 - **Canonical translation checkpoint**: the runtime passes the stable canonical checkpoint path to the
   translator while the SRT itself is staged, so a retried attempt resumes from batches already committed
-  instead of re-translating; the checkpoint is only promoted together with the artifact.
+  instead of re-translating. Each finished batch is written to the canonical checkpoint immediately inside a
+  lease-fenced transaction (`with_task_lease`) instead of waiting for the task to succeed; only when the repo
+  exposes no lease-fenced hook is the checkpoint staged and promoted together with the artifact.
   Checkpoint ownership is bound to the frozen lease identity; the P1 re-verification covers the original
   outside-lock-write and dynamic-identity counterexamples.
 - **Correctness**: `/jobs/by-path` returns 200 again; DAG is rejected at enqueue when it has no ASR stage, two ASR stages, no `extract` dependency or `translate` without an ASR dependency
@@ -374,7 +376,7 @@ with **zero** `nvidia-*` packages.
 - **Resources**: in-process model cache + semaphore (`model_cache_size`, `model_parallelism`)
 - **Security**: `require_token`, `allow_placeholder_token`, `docs_enabled`, `allowed_video_roots`, `allowed_copy_back_roots`, `bind_host/bind_port`; constant-time token comparison
 - **Observability**: `/healthz`, `/readyz`, `/metrics`, request-id logging, 5-minute queue throughput
-- **Delivery**: CI workflow added; three consecutive green commits (`2623545` → 39996457310, `5e67c7b` → 39997343133, `c88cc80` → 39997953791; c88cc80 also green in 39997946922/39997927908). Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. `main` FF to `c88cc80`; annotated `v0.5.0` tag (object `6732f9c`, peeled `c88cc80`) is pushed and will be re-pointed to this final documentation commit
+- **Delivery**: CI workflow added; three consecutive green commits (`2623545` → 39996457310, `5e67c7b` → 39997343133, `c88cc80` → 39997953791; c88cc80 also green in 39997946922/39997927908). Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. `main` is FFed through the release documentation commits (currently `f495fe0`); the parent FFs this final docs update; annotated `v0.5.0` tag is pushed and points to this final documentation commit (parent re-points after the final docs commit)
 
 ### Planned
 
@@ -405,14 +407,14 @@ installed. No paid LLM request was sent during this verification pass.
 | Real 2-hour E2E | **not verified** | 4 configured `/srv/media/...` paths missing; `/srv/media/jellyfin` empty; only 30s/180s samples |
 | GPU memory peak | **not verified** | `nvidia-smi` exit 255, `NVML GPU access blocked by OS` |
 | Provider-side token rotation | **not done / no evidence** | operator action; local deletion/ignore is not revocation |
-| v0.5.0 tag/release | **pushed; parent will re-point** | annotated tag object `6732f9c`, peeled `c88cc80`; release parent re-points it to this final documentation commit |
+| v0.5.0 tag/release | **pushed; points to final docs commit** | annotated `v0.5.0` tag points to this final documentation commit; release parent re-points it after the final docs commit |
 
 ## Known issues
 
 - The ruff baseline (`E9` + `F`) still reports findings on pre-existing modules; CI only enforces a syntax gate.
 - `pyproject.toml` keeps `prometheus-client` in the main dependencies for `/metrics`; if the package is missing at runtime, `/metrics` must degrade gracefully instead of breaking the app.
-- **v0.5.0 tag re-point**: the annotated tag is already pushed (object `6732f9c`, peeled `c88cc80`); the parent
-  will re-point it to the final documentation commit. The historical `v0.4.0` tag was also backfilled at `b029d07`.
+- **v0.5.0 tag alignment**: the annotated tag is pushed and points to this final documentation commit; the
+  parent re-points it after the final docs commit. The historical `v0.4.0` tag was also backfilled at `b029d07`.
 - End-to-end acceptance on a real 2-hour sample (wall-clock per stage, request counts, GPU memory peaks,
   `kill -9` resume) is **not yet verified**. Re-checked 2026-10-23: the four paths in
   `tests/e2e/video_paths.txt` under `/srv/media/jellyfin/...` are all missing, `/srv/media/jellyfin` is empty,

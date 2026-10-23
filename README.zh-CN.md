@@ -14,8 +14,8 @@
 > `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)
 > （push feature/main/tag 触发的 39997946922 / 39997927908 也同为该提交成功）。
 > 七项 P1 已由官方实施代理修复，并由 Sol 用原真 SQLite/文件反例及跨 FS copyback、copy 期间 symlink 替换
-> 两路径独立复验关闭。annotated `v0.5.0` tag 已 push（tag object `6732f9c`，peeled `c88cc80`），
-> 父将把它重指到本次最终文档提交；真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据。
+> 两路径独立复验关闭。annotated `v0.5.0` tag 已 push，并指向本次最终文档提交；父将在最终文档提交后
+> 重新对齐 tag。真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据。
 > 详见[验证状态](#验证状态)。
 
 ## 项目定位
@@ -343,7 +343,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 - [x] `v0.3.0`：WhisperX 阶段、显式 DAG E2E、确定性退出日志、中断续跑增强。
 - [x] `v0.4.0`：全局 API 鉴权、安全 drain 停机、分轮停机 E2E、小时级 artifact 清理调度。
 - [x] `v0.5.0`：可靠性与翻译链路加固——任务生命周期闭环（租约心跳/回收/fencing/级联/有界停机）、入队即校验 DAG 语义、ASR wav 契约、retry/cancel 接口、翻译并发上限 2 + 按批检查点续跑、产物原子写、模型缓存与并发上限、安全 fail-closed 默认值 + 路径白名单、结构化日志 + 健康检查/指标、CI + 锁文件 + 密钥治理
-  - tag/发布证据见[验证状态](#验证状态)：连续绿色提交 `2623545` → 39996457310、`5e67c7b` → 39997343133、`c88cc80` → 39997953791；annotated `v0.5.0` tag object `6732f9c`（peeled `c88cc80`）已 push，父将重指到本次最终文档提交。
+  - tag/发布证据见[验证状态](#验证状态)：连续绿色提交 `2623545` → 39996457310、`5e67c7b` → 39997343133、`c88cc80` → 39997953791；annotated `v0.5.0` tag 已 push 并指向本次最终文档提交（父在最终文档提交后重指）。
 
 ### 相比 v0.4.0 的增量
 
@@ -354,7 +354,8 @@ WHISPER_STT_REAL_MEDIA=1 \
   （`with_task_lease` / `publish_task_artifacts`）。设计目标是旧 attempt 无法覆盖新 attempt 的产物，被拒的暂存会被清理；
   租约身份 ABA、stop/drain tuple-fenced 回滚与 promotion 异常收敛已由 P1 复验覆盖（见“验证状态”）。
 - **canonical 翻译检查点**：runtime 把稳定的 canonical 检查点路径传给翻译器，而字幕本体走暂存；
-  重试时可从未完成批次续跑，检查点与产物一起 promotion 落地。
+  重试时可从未完成批次续跑。每个完成批次都会在租约事务（`with_task_lease`）内立即写入 canonical 检查点，
+  而不是等任务成功才落盘；仅当 repo 不提供租约 fenced 钩子时，才先写暂存并在 promotion 时与产物一起正式化。
   检查点发布已绑定冻结租约身份；P1 复验覆盖原“锁外二写”和动态借身份反例。
 - **正确性**：`/jobs/by-path` 恢复 200；无 ASR 阶段 / 两个 ASR 阶段 / 缺 `extract` 依赖 / `translate` 无 ASR 依赖的 DAG 在入队时即被拒绝
 - **wav 契约**：ASR 读取 `artifacts/<job_id>/audio/<stem>.16k.wav`；wav 缺失报 `missing_audio_artifact`
@@ -362,7 +363,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 - **资源**：进程内模型缓存 + 信号量（`model_cache_size`、`model_parallelism`）
 - **安全**：`require_token`、`allow_placeholder_token`、`docs_enabled`、`allowed_video_roots`、`allowed_copy_back_roots`、`bind_host/bind_port`；token 常量时间比较
 - **可观测性**：`/healthz`、`/readyz`、`/metrics`、request-id 日志、队列 5 分钟吞吐
-- **交付**：新增 CI workflow；连续三个绿色提交（`2623545` → 39996457310、`5e67c7b` → 39997343133、`c88cc80` → 39997953791；c88cc80 另有 39997946922/39997927908 成功）。`uv.lock` 纳入跟踪（普通包公共 PyPI、torch explicit cu128）、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；`main` 已 FF 到 `c88cc80`，annotated `v0.5.0` tag（object `6732f9c`，peeled `c88cc80`）已 push，父将重指到最终文档提交
+- **交付**：新增 CI workflow；连续三个绿色提交（`2623545` → 39996457310、`5e67c7b` → 39997343133、`c88cc80` → 39997953791；c88cc80 另有 39997946922/39997927908 成功）。`uv.lock` 纳入跟踪（普通包公共 PyPI、torch explicit cu128）、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；`main` 已 FF 到发布文档提交（当前 `f495fe0`），本次最终文档由父再 FF；annotated `v0.5.0` tag 已 push 并指向本次最终文档提交（父在最终文档提交后重指）
 
 ### 规划中
 
@@ -392,13 +393,13 @@ WHISPER_STT_REAL_MEDIA=1 \
 | 真实 2 小时 E2E | **未验证** | `/srv/media/...` 4 条路径都不存在；`/srv/media/jellyfin` 为空；只有 30s/180s 样本 |
 | GPU 显存峰值 | **未验证** | `nvidia-smi` 退出 255，`NVML GPU access blocked by OS` |
 | 供应商侧 token 轮换 | **未完成 / 无证据** | 属于外部操作；本地删除/忽略不等于撤销 |
-| v0.5.0 tag/发布 | **已 push；父将重指** | annotated tag object `6732f9c`，peeled `c88cc80`；父将重指到本次最终文档提交 |
+| v0.5.0 tag/发布 | **已 push；指向本次最终文档提交** | annotated `v0.5.0` tag 指向本次最终文档提交；父在最终文档提交后重指 |
 
 ## 已知问题
 
 - ruff 基线（`E9` + `F`）在存量模块上仍有告警；CI 只做语法门禁。
 - `pyproject.toml` 为主依赖引入了 `prometheus-client`（`/metrics` 需要）；若运行环境缺少该包，`/metrics` 应优雅降级而不能拖垮应用。
-- **v0.5.0 tag 重指**：annotated tag 已 push（object `6732f9c`，peeled `c88cc80`）；父将重指到最终文档提交。历史 `v0.4.0` tag 也已补 push 到 `b029d07`。
+- **v0.5.0 tag 对齐**：annotated tag 已 push 并指向本次最终文档提交；父在最终文档提交后重指。历史 `v0.4.0` tag 也已补 push 到 `b029d07`。
 - 真实 2 小时样本端到端验收（各阶段墙钟、请求数、显存峰值、`kill -9` 续跑）**尚未验证**。
   2026-10-23 复核：`tests/e2e/video_paths.txt` 的 4 条 `/srv/media/jellyfin/...` 路径仍全部不存在，
   `/srv/media/jellyfin` 为空；本机只有 30s / 180s 样本；`nvidia-smi` 退出 255 并报
