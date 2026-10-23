@@ -4,10 +4,12 @@ A local movie translation pipeline that combines `ffmpeg`, `Whisper/WhisperX`, a
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-> **Release status (2026-10-23): v0.5.0 is a release candidate, not yet accepted or tagged.**
-> Remote CI has not run (the origin repository has no workflow yet), real 2-hour/GPU acceptance
-> and provider-side token rotation are not verified, and final P1 fixes are still in progress.
-> See [Verification status](#verification-status).
+> **Release status (2026-10-24): v0.5.0 is a release candidate, not yet accepted or tagged.**
+> The first remote CI run ([39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390),
+> commit `bba96a0`) failed at the committed-lock check because `uv.lock` still referenced a host-only
+> TUNA mirror. The lock is now normalized to public PyPI and a rerun is pending; there is no green remote
+> run yet. Real 2-hour/GPU acceptance and provider-side token rotation remain unverified, and final P1
+> fixes are still in progress. See [Verification status](#verification-status).
 
 ## Project purpose
 
@@ -102,8 +104,9 @@ Optional GPU dependencies (local machines only):
 uv sync --group dev --group gpu
 ```
 
-`uv.lock` is tracked in this repository and resolves the full graph, including the `gpu` group
-(`torch` / `torchaudio` come from the explicit `pytorch-cu128` index).
+`uv.lock` is tracked in this repository and resolves the full graph, including the `gpu` group.
+Normal packages resolve from the explicit public PyPI default index (`https://pypi.org/simple`, wheels from
+`files.pythonhosted.org`); `torch` / `torchaudio` remain pinned to the explicit `pytorch-cu128` index.
 
 ## Configuration
 
@@ -293,18 +296,21 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` is defined for every push / pull request. **The origin repository does not
-have this workflow yet and no remote CI run is green**, so local checks below are not a substitute for the
-required two remote CI runs.
+`.github/workflows/ci.yml` runs on every push / pull request. The workflow is on origin, but **no remote
+CI run is green yet**: the first run ([39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390),
+commit `bba96a0`) failed at the committed-lock check because `uv.lock` still referenced a host-only TUNA
+mirror. The lock has been normalized to public PyPI and a rerun is pending; local checks below are not a
+substitute for the required two green remote runs.
 
 - `secret-scan`: `.github/scripts/secret_scan.sh` fails if a tracked file contains a real
   `sk-…` / `hf_…` / `ghp_…` / `AIza…` token or a key file such as `hf-token.md` is committed.
   Tokens must start at a word boundary, so identifiers such as `task-<long-id>` are not false positives;
   `secret_scan_selftest.sh` checks both true positives (keys in quotes/after `=` or `:`) and that negative case.
-- `pytest (python 3.10, cpu)`: verifies the committed lock (`uv lock --check --python 3.10`) → applies
-  `ci-cpu-sources.py` (torch/torchaudio → PyTorch CPU index, CI only) → `uv lock` → `uv sync --group dev`
-  (no `gpu` group) → CPU subset of unit tests → full suite → syntax gate (`python -m compileall` on tracked
-  files) → boots the app from `config.example.ini` in a temp dir.
+- `pytest (python 3.10, cpu)`: verifies the committed lock (`uv lock --check --python 3.10`) in a clean
+  runner environment (explicit public PyPI default index; no host TUNA config) → applies `ci-cpu-sources.py`
+  (torch/torchaudio → PyTorch CPU index, CI only) → `uv lock` → `uv sync --group dev` (no `gpu` group) →
+  CPU subset of unit tests → full suite → syntax gate (`python -m compileall` on tracked files) → boots the
+  app from `config.example.ini` in a temp dir.
 
 `UV_TORCH_BACKEND=cpu` alone is **not** enough: explicit `[tool.uv.sources]` win over the torch backend, so CI
 rewrites the index to `https://download.pytorch.org/whl/cpu` and drops the `+cu128` local version. Verified in a
@@ -348,7 +354,7 @@ with **zero** `nvidia-*` packages.
 - **Resources**: in-process model cache + semaphore (`model_cache_size`, `model_parallelism`)
 - **Security**: `require_token`, `allow_placeholder_token`, `docs_enabled`, `allowed_video_roots`, `allowed_copy_back_roots`, `bind_host/bind_port`; constant-time token comparison
 - **Observability**: `/healthz`, `/readyz`, `/metrics`, request-id logging, 5-minute queue throughput
-- **Delivery (not complete)**: CI workflow added (not yet run remotely), tracked `uv.lock` (`prometheus-client` added), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed; source merge, remote CI runs and v0.5.0 tag are still owned by the release parent
+- **Delivery (not complete)**: CI workflow added (first remote run failed at the lock check due an implicit host TUNA mirror; lock normalized to public PyPI, rerun pending), tracked `uv.lock`, real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed; source merge, two green remote CI runs and v0.5.0 tag are still owned by the release parent
 
 ### Planned
 
@@ -359,7 +365,7 @@ with **zero** `nvidia-*` packages.
 - Alerting on top of the existing metrics (log/metric dashboards)
 - Multi-user permission and quota control
 
-## Verification status (2026-10-23)
+## Verification status (2026-10-24)
 
 All local checks below used the strict shared `.venv`; no `uv sync` was run in it and no GPU packages were
 installed. No paid LLM request was sent during this verification pass.
@@ -367,11 +373,14 @@ installed. No paid LLM request was sent during this verification pass.
 | Gate | Status | Evidence / remaining gap |
 |---|---|---|
 | Secret scanner + self-test | passed locally | `secret_scan.sh` and `secret_scan_selftest.sh` exit 0 |
-| Committed lock reproducible | passed locally | `uv lock --check --python /home/base/repo/video-stt-whisper-server/.venv/bin/python` exit 0 |
+| Child lock on public PyPI | passed locally | TUNA 0; 201 `pypi.org/simple` sources; 2489 `files.pythonhosted.org` URLs; `torch/torchaudio` still `2.8.0+cu128` (4 refs) |
+| Root lock on public PyPI | passed locally | TUNA 0; 140 `pypi.org/simple` sources; 2199 `files.pythonhosted.org` URLs; 143 packages; check exit 0 |
+| Clean-env lock check | passed locally | empty XDG, no `UV_INDEX`/`UV_DEFAULT_INDEX`: child `uv lock --check --python 3.10` and root check exit 0 |
+| Lock graph equivalence | passed locally | child 144 and root 143 packages; versions/sdist+wheel hashes/dependency graph unchanged (only source URLs/size metadata normalized) |
 | CI CPU torch override | passed locally | temp-copy lock/dry-run resolves `torch/torchaudio==2.8.0+cpu`, zero `nvidia-*` installs |
 | Bootstrap smoke (explicit token + missing model) | passed locally | wrong token 401; queue/health 200; `/readyz` 503; model dir not created |
 | Full pytest suite | passed locally | 527 passed, 5 deselected in 37.73s (2026-10-23 23:29) |
-| Remote CI on the two release commits | **not run** | origin has no workflow yet; no green remote run |
+| Remote CI | **first run failed; rerun pending** | run 39981535390 @ `bba96a0` failed at `uv lock --check` because the lock used a host-only TUNA mirror; lock normalized to public PyPI, no green run yet |
 | Real 2-hour E2E | **not verified** | 4 configured `/srv/media/...` paths missing; `/srv/media/jellyfin` empty; only 30s/180s samples |
 | GPU memory peak | **not verified** | `nvidia-smi` exit 255, `NVML GPU access blocked by OS` |
 | Provider-side token rotation | **not done / no evidence** | operator action; local deletion/ignore is not revocation |

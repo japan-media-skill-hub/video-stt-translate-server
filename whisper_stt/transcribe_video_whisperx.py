@@ -146,7 +146,11 @@ def main() -> int:
         audio_input = args.temp_audio or input_path
         if not audio_input.is_absolute():
             audio_input = repo_root / audio_input
+        # 契约优先：视频输入必须在调用 ASR/外部工具（ffprobe 等）之前就报
+        # missing_audio_artifact，与 transcribe_video.py 保持同一顺序。
+        ensure_wav_artifact(audio_input)
 
+    # 预抽分支在此统一校验新生成的 wav；关闭预抽分支已提前校验（幂等、开销极小）。
     ensure_wav_artifact(audio_input)
 
     started = time.perf_counter()

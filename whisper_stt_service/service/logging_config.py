@@ -395,6 +395,7 @@ def configure_logging(
 
     返回实际应用的配置字典，便于 bootstrap 记录生效的日志文件与等级。
     `log_dir` 不存在时自动创建；创建失败时降级为仅控制台，不阻断启动。
+    成功返回时 `service.log` 已创建并校验可写，运维可立即 tail，无需等待首条日志。
     """
 
     file_dir: Path | None = None
@@ -402,6 +403,14 @@ def configure_logging(
         candidate = Path(log_dir)
         try:
             candidate.mkdir(parents=True, exist_ok=True)
+            # 文件 handler 用 delay=True 懒打开：只有第一条落到该 handler 的
+            # 记录写入时才创建文件。启动期若没有达到配置等级的记录（例如
+            # metrics 关闭 + log_level=WARNING，启动期的 INFO 全被过滤），
+            # 运维将拿不到 service.log。这里先 open/close 一次，把“文件存在”
+            # 与“可写”前移到 configure 阶段；失败则与建目录一致，记录 error
+            # 后降级为仅控制台，不阻断启动。
+            with (candidate / LOG_FILE_NAME).open("a", encoding="utf-8"):
+                pass
             file_dir = candidate
         except OSError as exc:  # 只读盘 / 权限不足时不应阻断服务启动。
             _logger().error(

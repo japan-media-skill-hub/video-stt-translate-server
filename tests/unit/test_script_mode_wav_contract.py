@@ -90,6 +90,19 @@ def test_ensure_wav_artifact_rejects_video_payload(tmp_path: Path, tv) -> None:
         tv.ensure_wav_artifact(fake)
 
 
+def test_probe_duration_returns_none_when_ffprobe_missing(
+    tmp_path: Path, tv, monkeypatch
+) -> None:
+    """干净 CI 无 ffprobe 时探测降级为 None，不得抛 FileNotFoundError。"""
+
+    def missing_ffprobe(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(tv.subprocess, "run", missing_ffprobe)
+
+    assert tv._probe_duration(tmp_path / "sample.mp4") is None
+
+
 def _install_fake_model(tv, monkeypatch, seen: dict) -> None:
     """把 WhisperModel 替换为记录输入路径的假模型。"""
 
@@ -163,6 +176,49 @@ def test_main_default_preextracts_wav_and_never_feeds_video(
     assert "こんにちは" in output.read_text(encoding="utf-8")
 
 
+def test_main_default_preextract_survives_missing_ffprobe(
+    tmp_path: Path, tv, monkeypatch
+) -> None:
+    """默认预抽在无 ffprobe 的 runner 上仍成功（进度降级，不阻断 wav 提取）。"""
+
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"dummy-video")
+    output = tmp_path / "sample.ja.srt"
+
+    def fake_extract(_input_path, output_wav, _duration):  # type: ignore[no-untyped-def]
+        output_wav.parent.mkdir(parents=True, exist_ok=True)
+        output_wav.write_bytes(WAV_BYTES)
+
+    def missing_ffprobe(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise FileNotFoundError("ffprobe")
+
+    monkeypatch.setattr(tv, "_extract_audio_with_progress", fake_extract)
+    monkeypatch.setattr(tv.subprocess, "run", missing_ffprobe)
+    monkeypatch.setattr(
+        tv,
+        "_parse_args",
+        lambda: SimpleNamespace(
+            input=video,
+            output=output,
+            model="fake-model",
+            language="ja",
+            device="cpu",
+            compute_type="int8",
+            beam_size=5,
+            preextract_wav=True,
+            temp_audio=None,
+            keep_temp_audio=False,
+            progress_every=25,
+        ),
+    )
+    seen: dict = {}
+    _install_fake_model(tv, monkeypatch, seen)
+
+    assert tv.main() == 0
+    assert seen["audio_path"].endswith(".16k.wav")
+    assert "こんにちは" in output.read_text(encoding="utf-8")
+
+
 def test_main_without_preextract_rejects_video_input(
     tmp_path: Path, tv, monkeypatch
 ) -> None:
@@ -172,6 +228,15 @@ def test_main_without_preextract_rejects_video_input(
     video.write_bytes(b"dummy-video")
     output = tmp_path / "sample.ja.srt"
 
+    def _must_not_probe(_path):  # type: ignore[no-untyped-def]
+        raise AssertionError("视频输入必须在 ffprobe 前被 wav 契约拒绝")
+
+    def _must_not_resolve(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        raise AssertionError("视频输入必须在 runtime/模型解析前被拒绝")
+
+    # 即使 runner 有 ffprobe，也不允许先探测；契约必须先拒绝视频输入。
+    monkeypatch.setattr(tv, "_probe_duration", _must_not_probe)
+    monkeypatch.setattr(tv, "_resolve_runtime", _must_not_resolve)
     monkeypatch.setattr(
         tv,
         "_parse_args",
@@ -380,7 +445,11 @@ def test_whisperx_without_preextract_rejects_video_input(
         called["n"] += 1
         return {}
 
+    def _must_not_probe(_path):  # type: ignore[no-untyped-def]
+        raise AssertionError("WhisperX 视频输入必须在 ffprobe 前被 wav 契约拒绝")
+
     args = _whisperx_args(tmp_path, preextract_wav=False)
+    monkeypatch.setattr(wx, "_probe_duration", _must_not_probe)
     monkeypatch.setattr(wx, "run_stt_whisperx", fake_run)
     monkeypatch.setattr(wx, "_parse_args", lambda: args)
 

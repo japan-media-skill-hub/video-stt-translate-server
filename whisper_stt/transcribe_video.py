@@ -164,6 +164,13 @@ def _render_bar(progress: float, width: int = 28) -> str:
 
 
 def _probe_duration(path: Path) -> float | None:
+    """用 ffprobe 探测媒体时长；ffprobe 缺失或不可用时返回 None（仅降级进度）。
+
+    干净 CI runner 可能没有 ffprobe。这里必须把 `FileNotFoundError`/其它
+    `OSError` 当作“无法探测”而不是致命错误：wav 契约校验（ensure_wav_artifact）
+    才是决定输入能否进入模型的前置条件，不能被外部工具缺失抢先掩盖。
+    """
+
     cmd = [
         "ffprobe",
         "-v",
@@ -174,7 +181,11 @@ def _probe_duration(path: Path) -> float | None:
         "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError:
+        # ffprobe 不存在或不可执行：进度显示降级为未知，不影响后续流程。
+        return None
     if proc.returncode != 0:
         return None
     text = proc.stdout.strip()
@@ -307,11 +318,13 @@ def main() -> int:
             model_ref = str(repo_model)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_duration = _probe_duration(input_path)
-    device, compute_type = _resolve_runtime(args.device, args.compute_type)
 
     temp_audio = None
     if args.preextract_wav:
+        # 预抽分支需要视频时长驱动进度；ffprobe 缺失时 _probe_duration 返回 None，
+        # 只降级进度显示，不影响后续 wav 提取与校验。
+        source_duration = _probe_duration(input_path)
+        device, compute_type = _resolve_runtime(args.device, args.compute_type)
         temp_audio = args.temp_audio
         if temp_audio is None:
             temp_audio = output_path.with_suffix(".tmp.16k.wav")
@@ -325,7 +338,13 @@ def main() -> int:
         audio_input = args.temp_audio or input_path
         if not audio_input.is_absolute():
             audio_input = repo_root / audio_input
+        # 契约优先：先校验 wav，再探测时长/解析 runtime。视频输入必须在调用
+        # ffprobe、torch 或模型之前就报 missing_audio_artifact。
+        ensure_wav_artifact(audio_input)
+        source_duration = _probe_duration(input_path)
+        device, compute_type = _resolve_runtime(args.device, args.compute_type)
 
+    # 预抽分支在此统一校验新生成的 wav；关闭预抽分支已提前校验（幂等、开销极小）。
     ensure_wav_artifact(audio_input)
 
     print(f"input={input_path}", flush=True)

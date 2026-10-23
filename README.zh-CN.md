@@ -4,9 +4,11 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-> **发布状态（2026-10-23）：v0.5.0 为 release candidate，尚未最终验收、尚未打 tag。**
-> 远端 CI 尚未运行（origin 仓库还没有 workflow），真实 2 小时 / GPU 验收与供应商侧 token 轮换均无证据，
-> 最终 P1 修复仍在进行。详见[验证状态](#验证状态)。
+> **发布状态（2026-10-24）：v0.5.0 为 release candidate，尚未最终验收、尚未打 tag。**
+> 首次远端 CI（[run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)，
+> commit `bba96a0`）在提交锁校验处失败：`uv.lock` 仍引用开发机专属 TUNA 镜像。锁已归一为公共 PyPI，
+> 等待重跑，目前没有远端绿灯。真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据，最终 P1 修复仍在进行。
+> 详见[验证状态](#验证状态)。
 
 ## 项目定位
 
@@ -100,7 +102,7 @@ uv sync --group dev          # dev 分组（本机 / CI）
 uv sync --group dev --group gpu
 ```
 
-`uv.lock` 已纳入版本跟踪，覆盖完整解析图（含 `gpu` 组，`torch` / `torchaudio` 来自显式的 `pytorch-cu128` 索引）。
+`uv.lock` 已纳入版本跟踪，覆盖完整解析图（含 `gpu` 组）。普通包走显式公共 PyPI 默认源（`https://pypi.org/simple`，wheel 走 `files.pythonhosted.org`）；`torch` / `torchaudio` 仍由显式 `pytorch-cu128` 索引提供。
 
 ## 配置策略
 
@@ -287,16 +289,19 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` 为每次 push / pull request 定义。**origin 仓库目前还没有该 workflow，
-也没有任何远端 CI 绿灯**，因此本地检查不能替代最终要求的两次远端 CI。
+`.github/workflows/ci.yml` 在每次 push / pull request 上运行。workflow 已推送到 origin，但**尚无远端
+CI 绿灯**：首次运行（[run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)，
+commit `bba96a0`）在提交锁校验处失败，原因是 `uv.lock` 仍引用开发机专属 TUNA 镜像。锁已归一为公共 PyPI，
+等待重跑；本地检查不能替代最终要求的两次远端 CI。
 
 - `secret-scan`：`.github/scripts/secret_scan.sh` 在纳入跟踪的文件含真实 `sk-…` / `hf_…` / `ghp_…` / `AIza…` 令牌，
   或提交了 `hf-token.md` 一类密钥文件时直接失败。令牌必须落在词边界上，因此 `task-<长ID>` 这类标识符不会误报；
   `secret_scan_selftest.sh` 同时验证正例（引号内 / `=`、`:` 后的真实 key）与该负例。
-- `pytest (python 3.10, cpu)`：先校验提交锁（`uv lock --check --python 3.10`）→
-  执行 `ci-cpu-sources.py`（把 torch/torchaudio 源改为 PyTorch CPU 索引，仅 CI）→
-  `uv lock --python 3.10` → `uv sync --group dev`（不装 `gpu` 组）→ 先跑 CPU 子集，再跑完整测试集 →
-  语法门禁（`python -m compileall`，仅跟踪文件）→ 用 `config.example.ini` 在临时目录装配应用冒烟。
+- `pytest (python 3.10, cpu)`：先在干净 runner 环境校验提交锁（`uv lock --check --python 3.10`；
+  显式公共 PyPI 默认源、无宿主机 TUNA 配置）→ 执行 `ci-cpu-sources.py`（把 torch/torchaudio 源改为
+  PyTorch CPU 索引，仅 CI）→ `uv lock --python 3.10` → `uv sync --group dev`（不装 `gpu` 组）→
+  先跑 CPU 子集，再跑完整测试集 → 语法门禁（`python -m compileall`，仅跟踪文件）→ 用
+  `config.example.ini` 在临时目录装配应用冒烟。
 
 只设 `UV_TORCH_BACKEND=cpu` **不够**：显式的 `[tool.uv.sources]` 会覆盖 torch backend 设置，
 所以 CI 直接把索引改成 `https://download.pytorch.org/whl/cpu` 并去掉 `+cu128` 本地版本约束。
@@ -336,7 +341,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 - **资源**：进程内模型缓存 + 信号量（`model_cache_size`、`model_parallelism`）
 - **安全**：`require_token`、`allow_placeholder_token`、`docs_enabled`、`allowed_video_roots`、`allowed_copy_back_roots`、`bind_host/bind_port`；token 常量时间比较
 - **可观测性**：`/healthz`、`/readyz`、`/metrics`、request-id 日志、队列 5 分钟吞吐
-- **交付（未完成）**：新增 CI workflow（尚未在远端运行）、`uv.lock` 纳入跟踪（新增 `prometheus-client`）、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；源码整合、两次远端 CI 与 v0.5.0 tag 仍由发布父代理统一执行
+- **交付（未完成）**：新增 CI workflow（首次远端运行在锁校验失败，原因是隐式宿主机 TUNA 镜像；锁已归一公共 PyPI，等待重跑）、`uv.lock` 纳入跟踪、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；源码整合、两次远端 CI 绿灯与 v0.5.0 tag 仍由发布父代理统一执行
 
 ### 规划中
 
@@ -347,18 +352,21 @@ WHISPER_STT_REAL_MEDIA=1 \
 - 基于现有指标的告警与看板。
 - 多用户权限、并发限制与资源配额治理。
 
-## 验证状态（2026-10-23）
+## 验证状态（2026-10-24）
 
 以下本地检查均使用主 `.venv`；未在该 venv 执行 `uv sync`，未安装 GPU 包，本次复核未发送付费 LLM 请求。
 
 | 门禁 | 状态 | 证据 / 剩余缺口 |
 |---|---|---|
 | secret 扫描 + 自测 | 本地通过 | `secret_scan.sh` 与 `secret_scan_selftest.sh` exit 0 |
-| 提交锁可重现 | 本地通过 | `uv lock --check --python /home/base/repo/video-stt-whisper-server/.venv/bin/python` exit 0 |
+| child 锁走公共 PyPI | 本地通过 | TUNA 0；201 个 `pypi.org/simple` source；2489 个 `files.pythonhosted.org` URL；`torch/torchaudio` 仍为 `2.8.0+cu128`（4 处） |
+| root 锁走公共 PyPI | 本地通过 | TUNA 0；140 个 `pypi.org/simple` source；2199 个 `files.pythonhosted.org` URL；143 packages；check exit 0 |
+| 干净环境锁校验 | 本地通过 | 空 XDG、无 `UV_INDEX`/`UV_DEFAULT_INDEX`：child `uv lock --check --python 3.10` 与 root check 均 exit 0 |
+| 锁图等价性 | 本地通过 | child 144 / root 143 packages；版本、sdist+wheel 哈希、依赖图未变（仅 source URL/size 元数据归一） |
 | CI CPU torch 覆盖 | 本地通过 | 临时副本 lock/dry-run 解析为 `torch/torchaudio==2.8.0+cpu`，待安装 `nvidia-*` 为 0 |
 | 启动冒烟（显式 token + 缺失模型） | 本地通过 | 错误 token 401；queue/health 200；`/readyz` 503；未创建 model 目录 |
 | 全量 pytest | 本地通过 | 527 passed / 5 deselected，37.73s（2026-10-23 23:29） |
-| 两个发布提交的远端 CI | **未运行** | origin 还没有 workflow；无远端绿灯 |
+| 远端 CI | **首次失败，待重跑** | run 39981535390 @ `bba96a0` 在 `uv lock --check` 失败（锁含宿主机 TUNA 镜像）；锁已归一公共 PyPI，尚无绿灯 |
 | 真实 2 小时 E2E | **未验证** | `/srv/media/...` 4 条路径都不存在；`/srv/media/jellyfin` 为空；只有 30s/180s 样本 |
 | GPU 显存峰值 | **未验证** | `nvidia-smi` 退出 255，`NVML GPU access blocked by OS` |
 | 供应商侧 token 轮换 | **未完成 / 无证据** | 属于外部操作；本地删除/忽略不等于撤销 |

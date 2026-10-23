@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import os
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -383,6 +384,12 @@ def test_build_app_metrics_disabled_is_404(monkeypatch, tmp_path) -> None:
     app = _build_app(
         monkeypatch, tmp_path, **{"observability.metrics_enabled": "false"}
     )
+    service_log = tmp_path / "logs" / "service.log"
+    # G：configure_logging 返回时 service.log 就必须已存在且可写，不能依赖
+    # 后续是否产生日志记录（clean-CPU CI 上没有 tmpfs 的 WAL WARNING，
+    # WARNING 等级下启动期可能一条落盘记录都没有）。
+    assert service_log.exists()
+    assert os.access(service_log, os.W_OK)
     client = TestClient(app)
     headers = {"X-API-Token": GOOD_TOKEN}
     assert app.state.metrics is None
@@ -390,6 +397,24 @@ def test_build_app_metrics_disabled_is_404(monkeypatch, tmp_path) -> None:
     assert client.get("/healthz", headers=headers).status_code == 200
     # 日志装配不受影响：service.log 已创建。
     assert (tmp_path / "logs" / "service.log").exists()
+
+
+def test_configure_logging_creates_service_log_immediately(tmp_path: Path) -> None:
+    """G：没有日志记录时，configure_logging 也必须立即创建可写的空 service.log。"""
+
+    from whisper_stt_service.service.logging_config import (
+        LOG_FILE_NAME,
+        configure_logging,
+    )
+
+    log_dir = tmp_path / "logs"
+    configure_logging(log_dir=log_dir, level="WARNING", jsonl=True)
+    service_log = log_dir / LOG_FILE_NAME
+    assert service_log.exists()
+    # WARNING 等级下启动期没有落盘记录，文件应为空；且必须已可写。
+    assert service_log.stat().st_size == 0
+    with service_log.open("a", encoding="utf-8"):
+        pass
 
 
 def test_build_app_writes_jsonl_service_log(monkeypatch, tmp_path) -> None:
