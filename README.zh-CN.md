@@ -4,11 +4,15 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-> **发布状态（2026-10-24）：v0.5.0 为 release candidate，尚未最终验收、尚未打 tag。**
-> 首次远端 CI（[run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)，
-> commit `bba96a0`）在提交锁校验处失败：`uv.lock` 仍引用开发机专属 TUNA 镜像。锁已归一为公共 PyPI，
-> 等待重跑，目前没有远端绿灯。真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据，最终 P1 修复仍在进行。
-> 详见[验证状态](#验证状态)。
+> **发布状态（2026-10-24）：v0.5.0 实现与 P1 验收完成；tag/发布证据待补。**
+> 远端 CI 历史：首次 [run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
+> （`bba96a0`）在提交锁校验失败：`uv.lock` 引用开发机专属 TUNA 镜像；第二次
+> [run 39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
+> （`66678d0`）锁校验通过，但两个 clean-runner 用例失败；第三次
+> [run 39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
+> （`2623545`）**成功**。第二个绿色 run 由本次文档提交触发，URL 待父补。七项 P1 已由官方实施代理修复，
+> 并由 Sol 用原真 SQLite/文件反例及跨 FS copyback、copy 期间 symlink 替换两路径独立复验关闭。
+> `v0.5.0` tag 仍待父创建；真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据。详见[验证状态](#验证状态)。
 
 ## 项目定位
 
@@ -26,14 +30,14 @@
 - **wav 契约**：ASR（`stt` / `stt_whisperx`）只消费 `extract` 产出的 16k 单声道 wav；wav 缺失或为 0 字节时任务失败并报 `missing_audio_artifact`。
 - **产物归属唯一**：`artifacts/<job_id>/{audio,asr,translate}/`，每阶段只有一个写者。
 - **入队即校验 DAG 语义**：必须恰好一个 ASR 阶段、ASR 依赖闭包必须含 `extract`、`translate` 依赖闭包必须含该 ASR 阶段。
-- **任务生命周期闭环（待最终验收）**：租约心跳、过期回收（reaper）、结果写回 fencing、上游失败级联（`blocked`）、崩溃恢复消耗重试预算、有界 drain 停机。
+- **任务生命周期闭环**：租约心跳、过期回收（reaper）、结果写回 fencing、上游失败级联（`blocked`）、崩溃恢复消耗重试预算、有界 drain 停机。
 - **重跑与取消接口**：`POST /jobs/{job_id}/retry`（仅 failed）与 `POST /jobs/{job_id}/cancel`（未开始的任务）。
-- **翻译链路加固（待最终验收）**：并发上限默认 2（`parallel`）、按批检查点续跑（`*.progress.json` + `source_sha256`）、原子写、缺 id 保留日文原文、4xx 不重试、请求带 `Idempotency-Key`；检查点 fencing 仍在修复。
+- **翻译链路加固**：并发上限默认 2（`parallel`）、按批检查点续跑（`*.progress.json` + `source_sha256`）、原子写、缺 id 保留日文原文、4xx 不重试、请求带 `Idempotency-Key`、检查点发布绑定冻结租约身份。
 - **模型缓存**：进程内 LRU 模型缓存 + 每模型并发信号量（`model_cache_size`、`model_parallelism`）。
-- **安全默认值（fail-closed）**：占位 token 拒绝启动、token 常量时间比较、视频路径/扩展名白名单、脚本模式 copy_back 的路径/符号链接逃逸校验（服务模式 sink 尚未接通）、docs 默认关闭、默认只监听 `127.0.0.1`。
+- **安全默认值（fail-closed）**：占位 token 拒绝启动、token 常量时间比较、视频路径/扩展名白名单、脚本/服务模式真实 copy_back sink 的路径/符号链接逃逸校验、docs 默认关闭、默认只监听 `127.0.0.1`。
 - **可观测性**：`request_id` 贯穿的结构化日志、`GET /healthz`、`GET /readyz`、`GET /metrics`（Prometheus）、队列最近 5 分钟吞吐。
 - WhisperX 可作为独立阶段接入（`stt_whisperx`：本地 VAD + batched ASR + 可选对齐），VAD 默认参数更激进（`vad_onset=0.35`、`vad_offset=0.2`）。
-- 脚本模式支持字幕产物回写（`[translation] copy_back`），输出 `.ja.srt` 与 `.zh.srt`；服务模式 copy_back 尚未接到真实 sink（见“验证状态”）。
+- 支持字幕产物回写（`[translation] copy_back`），输出 `.ja.srt` 与 `.zh.srt`；服务模式真实 sink 与跨 FS copyback 路径已实现并复验。
 - 支持可读任务 ID、任务归档、失败重试与中断续跑。
 - 支持小时级 artifact 自动清理（按已完成 job 清理目录，降低磁盘占用）。
 - 提供端到端验证脚本，支持轮询、超时、退出原因记录（`E2E_EXIT ...`）。
@@ -266,7 +270,8 @@ task_logs_root=/.../tmp/logs
 
 ## 测试
 
-默认测试（跳过真实媒体与 E2E；不依赖 ffmpeg、模型、GPU 与网络）：
+默认测试（跳过真实媒体与 E2E；不依赖 ffmpeg、模型、GPU 与网络；clean-runner CI 已证明脚本模式
+用例可在缺少 `ffprobe` 时通过）：
 
 ```bash
 cd /home/base/repo/video-stt-whisper-server/.worktrees/reliability-hardening
@@ -289,10 +294,19 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` 在每次 push / pull request 上运行。workflow 已推送到 origin，但**尚无远端
-CI 绿灯**：首次运行（[run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)，
-commit `bba96a0`）在提交锁校验处失败，原因是 `uv.lock` 仍引用开发机专属 TUNA 镜像。锁已归一为公共 PyPI，
-等待重跑；本地检查不能替代最终要求的两次远端 CI。
+`.github/workflows/ci.yml` 在每次 push / pull request 上运行。**run 3 已绿；第二个绿色 run 待本次
+文档提交触发**：
+
+- [run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
+  （`bba96a0`）：`uv lock --check` 失败，原因是 `uv.lock` 引用开发机专属 TUNA 镜像；
+- [run 39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
+  （`66678d0`）：锁校验通过；两个 clean-runner 用例失败（`service.log` 创建顺序、脚本模式 wav 校验
+  发生在 ffprobe 之后）；
+- [run 39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
+  （`2623545`）：**成功**。该提交让 `service.log` 立即创建，并在任何 ffprobe 调用前拒绝视频输入；
+  committed CI 仍先跑 CPU 子集再跑完整套件。
+
+第二个绿色 run 由本次文档提交触发，URL 待父补；本地检查不能替代第二个绿色远端 run。
 
 - `secret-scan`：`.github/scripts/secret_scan.sh` 在纳入跟踪的文件含真实 `sk-…` / `hf_…` / `ghp_…` / `AIza…` 令牌，
   或提交了 `hf-token.md` 一类密钥文件时直接失败。令牌必须落在词边界上，因此 `task-<长ID>` 这类标识符不会误报；
@@ -300,8 +314,8 @@ commit `bba96a0`）在提交锁校验处失败，原因是 `uv.lock` 仍引用�
 - `pytest (python 3.10, cpu)`：先在干净 runner 环境校验提交锁（`uv lock --check --python 3.10`；
   显式公共 PyPI 默认源、无宿主机 TUNA 配置）→ 执行 `ci-cpu-sources.py`（把 torch/torchaudio 源改为
   PyTorch CPU 索引，仅 CI）→ `uv lock --python 3.10` → `uv sync --group dev`（不装 `gpu` 组）→
-  先跑 CPU 子集，再跑完整测试集 → 语法门禁（`python -m compileall`，仅跟踪文件）→ 用
-  `config.example.ini` 在临时目录装配应用冒烟。
+  先跑 CPU 子集、再跑完整测试集（不跳过测试；上述 clean-runner 修复已去掉 ffprobe/日志顺序依赖）→
+  语法门禁（`python -m compileall`，仅跟踪文件）→ 用 `config.example.ini` 在临时目录装配应用冒烟。
 
 只设 `UV_TORCH_BACKEND=cpu` **不够**：显式的 `[tool.uv.sources]` 会覆盖 torch backend 设置，
 所以 CI 直接把索引改成 `https://download.pytorch.org/whl/cpu` 并去掉 `+cu128` 本地版本约束。
@@ -318,30 +332,27 @@ commit `bba96a0`）在提交锁校验处失败，原因是 `uv.lock` 仍引用�
 - [x] `v0.2.0`：DAG 规划、任务配置快照、归档接口、字幕回写、STT 参数配置化。
 - [x] `v0.3.0`：WhisperX 阶段、显式 DAG E2E、确定性退出日志、中断续跑增强。
 - [x] `v0.4.0`：全局 API 鉴权、安全 drain 停机、分轮停机 E2E、小时级 artifact 清理调度。
-
-### Release candidate（v0.5.0 — 尚未验收）
-
-- [ ] `v0.5.0`：可靠性与翻译链路加固——任务生命周期闭环（租约心跳/回收/fencing/级联/有界停机）、入队即校验 DAG 语义、ASR wav 契约、retry/cancel 接口、翻译并发上限 2 + 按批检查点续跑、产物原子写、模型缓存与并发上限、安全 fail-closed 默认值 + 路径白名单、结构化日志 + 健康检查/指标、CI + 锁文件 + 密钥治理
-  - 故意不勾选：最终验收尚未完成，远端 CI / v0.5.0 tag / 真实 2 小时 + GPU 证据均未取得。
+- [x] `v0.5.0`：可靠性与翻译链路加固——任务生命周期闭环（租约心跳/回收/fencing/级联/有界停机）、入队即校验 DAG 语义、ASR wav 契约、retry/cancel 接口、翻译并发上限 2 + 按批检查点续跑、产物原子写、模型缓存与并发上限、安全 fail-closed 默认值 + 路径白名单、结构化日志 + 健康检查/指标、CI + 锁文件 + 密钥治理
+  - tag/发布证据见[验证状态](#验证状态)：run 39996457310 已绿；第二个绿色 run 由本次文档提交触发，`v0.5.0` tag 由父创建。
 
 ### 相比 v0.4.0 的增量
 
-- **任务生命周期（目标行为，待最终验收）**：租约回收与 fencing；上游失败后下游置 `blocked`；启动恢复消耗重试预算；新增 `POST /jobs/{id}/retry` 与 `POST /jobs/{id}/cancel`
+- **任务生命周期**：租约回收与 fencing；上游失败后下游置 `blocked`；启动恢复消耗重试预算；新增 `POST /jobs/{id}/retry` 与 `POST /jobs/{id}/cancel`
 - **产物级 fencing（暂存 + promotion）**：每个 attempt 只写自己的私有暂存文件
   （`<name>.staging-<attempt>-<id>`），只有经 `ArtifactStaging.promote()` 才 `os.replace` 为正式产物；
   落地前在 `BEGIN IMMEDIATE` 事务内确认任务仍由同一 worker / 同一 attempt 持有
   （`with_task_lease` / `publish_task_artifacts`）。设计目标是旧 attempt 无法覆盖新 attempt 的产物，被拒的暂存会被清理；
-  租约身份 / stop 回滚等边界仍在修复（见“验证状态”）。
+  租约身份 ABA、stop/drain tuple-fenced 回滚与 promotion 异常收敛已由 P1 复验覆盖（见“验证状态”）。
 - **canonical 翻译检查点**：runtime 把稳定的 canonical 检查点路径传给翻译器，而字幕本体走暂存；
   重试时可从未完成批次续跑，检查点与产物一起 promotion 落地。
-  已接入 runtime，但仍**待最终验收**：检查点所有权 / 租约身份等 fencing 边界仍在修复。
+  检查点发布已绑定冻结租约身份；P1 复验覆盖原“锁外二写”和动态借身份反例。
 - **正确性**：`/jobs/by-path` 恢复 200；无 ASR 阶段 / 两个 ASR 阶段 / 缺 `extract` 依赖 / `translate` 无 ASR 依赖的 DAG 在入队时即被拒绝
 - **wav 契约**：ASR 读取 `artifacts/<job_id>/audio/<stem>.16k.wav`；wav 缺失报 `missing_audio_artifact`
-- **翻译**：`parallel` 默认 2（原 16）、新增 `max_chars`/`checkpoint_enabled`/`strict_ids`；按批检查点续跑（fencing 边界修复中）；4xx 不重试；`Idempotency-Key`；`zh.srt` 原子写
+- **翻译**：`parallel` 默认 2（原 16）、新增 `max_chars`/`checkpoint_enabled`/`strict_ids`；按批检查点续跑；4xx 不重试；`Idempotency-Key`；`zh.srt` 原子写；真实 copyback sink 及跨 FS/symlink 替换覆盖
 - **资源**：进程内模型缓存 + 信号量（`model_cache_size`、`model_parallelism`）
 - **安全**：`require_token`、`allow_placeholder_token`、`docs_enabled`、`allowed_video_roots`、`allowed_copy_back_roots`、`bind_host/bind_port`；token 常量时间比较
 - **可观测性**：`/healthz`、`/readyz`、`/metrics`、request-id 日志、队列 5 分钟吞吐
-- **交付（未完成）**：新增 CI workflow（首次远端运行在锁校验失败，原因是隐式宿主机 TUNA 镜像；锁已归一公共 PyPI，等待重跑）、`uv.lock` 纳入跟踪、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；源码整合、两次远端 CI 绿灯与 v0.5.0 tag 仍由发布父代理统一执行
+- **交付**：新增 CI workflow；run 3（39996457310 @ `2623545`）已绿，第二个绿色 run 由本次文档提交触发。`uv.lock` 纳入跟踪（普通包公共 PyPI、torch explicit cu128）、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；源码整合与 `v0.5.0` tag 仍由发布父代理统一执行
 
 ### 规划中
 
@@ -365,19 +376,20 @@ commit `bba96a0`）在提交锁校验处失败，原因是 `uv.lock` 仍引用�
 | 锁图等价性 | 本地通过 | child 144 / root 143 packages；版本、sdist+wheel 哈希、依赖图未变（仅 source URL/size 元数据归一） |
 | CI CPU torch 覆盖 | 本地通过 | 临时副本 lock/dry-run 解析为 `torch/torchaudio==2.8.0+cpu`，待安装 `nvidia-*` 为 0 |
 | 启动冒烟（显式 token + 缺失模型） | 本地通过 | 错误 token 401；queue/health 200；`/readyz` 503；未创建 model 目录 |
-| 全量 pytest | 本地通过 | 527 passed / 5 deselected，37.73s（2026-10-23 23:29） |
-| 远端 CI | **首次失败，待重跑** | run 39981535390 @ `bba96a0` 在 `uv lock --check` 失败（锁含宿主机 TUNA 镜像）；锁已归一公共 PyPI，尚无绿灯 |
+| 全量 pytest | 本地通过 | 532 passed / 5 deselected，41.13s（2026-10-24，全新 basetemp） |
+| 七项 P1（copyback sink、checkpoint 固定身份、finally compare-and-remove、stop/drain tuple-fenced rollback、promotion 异常收敛、atomic fenced 单写、worker boot nonce 防 ABA） | **已实现并独立复验** | 原真 SQLite/文件反例重跑通过；跨 FS `run_translate` fake-HTTP copyback 与 copy 期间 symlink 替换两路径通过 |
+| 远端 CI | **run 3 绿；第二绿待补** | run 39981535390 @ `bba96a0`：锁校验失败（宿主机 TUNA 镜像）；run 39995654486 @ `66678d0`：锁校验通过，2 个 clean-runner 用例失败（service.log 创建顺序、脚本 wav 校验在 ffprobe 之后）；run [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310) @ `2623545`：**成功**。第二个绿色 run 由本次文档提交触发（URL 待父补） |
 | 真实 2 小时 E2E | **未验证** | `/srv/media/...` 4 条路径都不存在；`/srv/media/jellyfin` 为空；只有 30s/180s 样本 |
 | GPU 显存峰值 | **未验证** | `nvidia-smi` 退出 255，`NVML GPU access blocked by OS` |
 | 供应商侧 token 轮换 | **未完成 / 无证据** | 属于外部操作；本地删除/忽略不等于撤销 |
-| v0.5.0 最终验收 | **待完成** | 服务模式 copy_back sink、租约身份/fencing、promotion 异常仍在修复 |
+| v0.5.0 tag/发布 | **待父完成** | 实现与 P1 验收完成；第二个绿色 run 后由父打 tag |
 
 ## 已知问题
 
 - ruff 基线（`E9` + `F`）在存量模块上仍有告警；CI 只做语法门禁。
 - `pyproject.toml` 为主依赖引入了 `prometheus-client`（`/metrics` 需要）；若运行环境缺少该包，`/metrics` 应优雅降级而不能拖垮应用。
-- **v0.5.0 尚未验收**：服务模式 copy_back 没有真实 sink；租约身份 / stop 回滚 / 检查点 fencing /
-  promotion 异常等 P1 仍在修复。不能用本地测试数量代替最终验收。
+- **v0.5.0 tag / 第二个绿色 run 仍待完成**：实现与七项 P1 已完成并独立复验，但 release tag 需要父在
+  文档提交 CI 绿色后创建。
 - 真实 2 小时样本端到端验收（各阶段墙钟、请求数、显存峰值、`kill -9` 续跑）**尚未验证**。
   2026-10-23 复核：`tests/e2e/video_paths.txt` 的 4 条 `/srv/media/jellyfin/...` 路径仍全部不存在，
   `/srv/media/jellyfin` 为空；本机只有 30s / 180s 样本；`nvidia-smi` 退出 255 并报

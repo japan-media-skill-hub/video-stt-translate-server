@@ -4,12 +4,17 @@ A local movie translation pipeline that combines `ffmpeg`, `Whisper/WhisperX`, a
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-> **Release status (2026-10-24): v0.5.0 is a release candidate, not yet accepted or tagged.**
-> The first remote CI run ([39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390),
-> commit `bba96a0`) failed at the committed-lock check because `uv.lock` still referenced a host-only
-> TUNA mirror. The lock is now normalized to public PyPI and a rerun is pending; there is no green remote
-> run yet. Real 2-hour/GPU acceptance and provider-side token rotation remain unverified, and final P1
-> fixes are still in progress. See [Verification status](#verification-status).
+> **Release status (2026-10-24): v0.5.0 implementation and P1 acceptance complete; tag/release evidence pending.**
+> Remote CI history: run [39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
+> (`bba96a0`) failed at the committed-lock check because the lock referenced a host-only TUNA mirror; run
+> [39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
+> (`66678d0`) passed the lock check but hit two clean-runner test issues; run
+> [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
+> (`2623545`) **succeeded**. The second green run is triggered by this documentation commit; its URL is to be
+> filled in by the release parent. The seven P1s have been implemented and independently re-verified by Sol
+> with the original real-SQLite/file counterexamples and the cross-FS copyback/symlink-swap tests. The
+> `v0.5.0` tag is still pending. Real 2-hour/GPU acceptance and provider-side token rotation remain unverified.
+> See [Verification status](#verification-status).
 
 ## Project purpose
 
@@ -28,14 +33,14 @@ Instead of isolated scripts, the service runs these stages as a DAG so jobs are 
 - **wav contract**: ASR (`stt` / `stt_whisperx`) consumes only the 16k mono wav produced by `extract`; a missing/empty wav fails the task with `missing_audio_artifact`
 - **Per-stage artifact ownership**: `artifacts/<job_id>/{audio,asr,translate}/`, one writer per stage
 - **DAG semantic validation at enqueue**: exactly one ASR stage, ASR must depend on `extract`, `translate` must depend on the ASR stage
-- **Task lifecycle closure (pending final acceptance)**: lease heartbeat, expired-lease reaper, fencing on result write-back, upstream failure cascade (`blocked`), startup recovery that consumes the retry budget, bounded drain shutdown
+- **Task lifecycle closure**: lease heartbeat, expired-lease reaper, fencing on result write-back, upstream failure cascade (`blocked`), startup recovery that consumes the retry budget, bounded drain shutdown
 - **Retry / cancel APIs**: `POST /jobs/{job_id}/retry` (failed jobs) and `POST /jobs/{job_id}/cancel` (not yet started)
-- **Translation hardening (pending final acceptance)**: concurrency capped at 2 by default (`parallel`), per-batch checkpoint resume (`*.progress.json` + `source_sha256`), atomic writes, missing-id fallback to the Japanese source, 4xx never retried, `Idempotency-Key` on every request; checkpoint fencing is still under fix
+- **Translation hardening**: concurrency capped at 2 by default (`parallel`), per-batch checkpoint resume (`*.progress.json` + `source_sha256`), atomic writes, missing-id fallback to the Japanese source, 4xx never retried, `Idempotency-Key` on every request, lease-identity-fenced checkpoint publishing
 - **Model cache**: in-process LRU model cache + per-model concurrency semaphore (`model_cache_size`, `model_parallelism`)
-- **Security defaults (fail-closed)**: placeholder tokens refuse startup, API token compared in constant time, video path / extension allow-lists, copy_back path/symlink-escape validation for the script-mode sink (the service-mode sink is still pending), docs disabled by default, binds to `127.0.0.1` by default
+- **Security defaults (fail-closed)**: placeholder tokens refuse startup, API token compared in constant time, video path / extension allow-lists, copy_back path/symlink-escape validation for the real script- and service-mode sinks, docs disabled by default, binds to `127.0.0.1` by default
 - **Observability**: structured logging with `request_id`, `GET /healthz`, `GET /readyz`, `GET /metrics` (Prometheus), queue throughput over the last 5 minutes
 - WhisperX stage support (`stt_whisperx`) for local VAD + batched ASR + optional alignment, with aggressive VAD defaults (`vad_onset=0.35`, `vad_offset=0.2`)
-- Script-mode subtitle copy-back (`[translation] copy_back`) to source video directories (`.ja.srt` and `.zh.srt`); service-mode copy-back is not wired to a real sink yet (see Verification status)
+- Subtitle copy-back (`[translation] copy_back`) to source video directories (`.ja.srt` and `.zh.srt`), including the service-mode real sink and cross-FS copyback path
 - Hourly artifact cleanup scheduler for completed jobs to control disk usage
 - E2E drivers with deterministic exit reason logging (`E2E_EXIT ...`)
 
@@ -271,7 +276,8 @@ task_logs_root=/.../tmp/logs
 
 ## Tests
 
-Default run (skips real media and E2E; no ffmpeg, model, GPU or network required):
+Default run (skips real media and E2E; no ffmpeg, model, GPU or network required; clean-runner CI proves
+the script-mode tests tolerate a missing `ffprobe`):
 
 ```bash
 cd /home/base/repo/video-stt-whisper-server/.worktrees/reliability-hardening
@@ -296,11 +302,20 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push / pull request. The workflow is on origin, but **no remote
-CI run is green yet**: the first run ([39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390),
-commit `bba96a0`) failed at the committed-lock check because `uv.lock` still referenced a host-only TUNA
-mirror. The lock has been normalized to public PyPI and a rerun is pending; local checks below are not a
-substitute for the required two green remote runs.
+`.github/workflows/ci.yml` runs on every push / pull request. **Run 3 is green; the second green run is
+pending on this documentation commit**:
+
+- run [39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
+  (`bba96a0`): failed at `uv lock --check` because the lock referenced a host-only TUNA mirror;
+- run [39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
+  (`66678d0`): lock check passed; two clean-runner tests failed (service.log creation order and
+  script-mode wav rejection happening after an ffprobe probe);
+- run [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
+  (`2623545`): **success**. That commit creates `service.log` immediately and rejects video input before any
+  ffprobe call; the committed CI still runs the CPU subset followed by the full suite.
+
+The second green run is triggered by this documentation commit; its URL is to be filled in by the release
+parent. Local checks below are not a substitute for the second green remote run.
 
 - `secret-scan`: `.github/scripts/secret_scan.sh` fails if a tracked file contains a real
   `sk-…` / `hf_…` / `ghp_…` / `AIza…` token or a key file such as `hf-token.md` is committed.
@@ -309,8 +324,9 @@ substitute for the required two green remote runs.
 - `pytest (python 3.10, cpu)`: verifies the committed lock (`uv lock --check --python 3.10`) in a clean
   runner environment (explicit public PyPI default index; no host TUNA config) → applies `ci-cpu-sources.py`
   (torch/torchaudio → PyTorch CPU index, CI only) → `uv lock` → `uv sync --group dev` (no `gpu` group) →
-  CPU subset of unit tests → full suite → syntax gate (`python -m compileall` on tracked files) → boots the
-  app from `config.example.ini` in a temp dir.
+  CPU subset of unit tests → full suite (no tests skipped; the clean-runner fixes above remove the
+  ffprobe/log-order dependencies) → syntax gate (`python -m compileall` on tracked files) → boots the app
+  from `config.example.ini` in a temp dir.
 
 `UV_TORCH_BACKEND=cpu` alone is **not** enough: explicit `[tool.uv.sources]` win over the torch backend, so CI
 rewrites the index to `https://download.pytorch.org/whl/cpu` and drops the `+cu128` local version. Verified in a
@@ -328,33 +344,30 @@ with **zero** `nvidia-*` packages.
 - [x] `v0.2.0`: DAG planning, archive API, copy-back, and runtime knobs
 - [x] `v0.3.0`: WhisperX stage, explicit DAG E2E, deterministic E2E exits, interrupted-run recovery
 - [x] `v0.4.0`: global API token auth, graceful drain shutdown, round-based shutdown E2E, and hourly artifact cleanup scheduler
-
-### Release candidate (v0.5.0 — not yet accepted)
-
-- [ ] `v0.5.0`: reliability & translation hardening — task lifecycle closure (lease heartbeat/reaper/fencing/cascade/bounded drain), enqueue-time DAG semantics, wav contract for ASR, retry/cancel APIs, translation concurrency cap 2 with per-batch checkpoint resume, atomic artifact writes, model cache + parallelism limits, security fail-closed defaults with path allow-lists, structured logging + health/readiness/metrics, CI + lockfile + secret hygiene
-  - Unchecked on purpose: final acceptance is pending, and remote CI / v0.5.0 tag / real 2-hour + GPU evidence are not available yet.
+- [x] `v0.5.0`: reliability & translation hardening — task lifecycle closure (lease heartbeat/reaper/fencing/cascade/bounded drain), enqueue-time DAG semantics, wav contract for ASR, retry/cancel APIs, translation concurrency cap 2 with per-batch checkpoint resume, atomic artifact writes, model cache + parallelism limits, security fail-closed defaults with path allow-lists, structured logging + health/readiness/metrics, CI + lockfile + secret hygiene
+  - Tag/release evidence is tracked in [Verification status](#verification-status): run 39996457310 is green; the second green run follows this documentation commit, and the `v0.5.0` tag is created by the release parent.
 
 ### Delta since v0.4.0
 
-- **Task lifecycle (target behavior, pending final acceptance)**: lease reaper and fencing; downstream tasks become `blocked` when an upstream task fails; startup recovery consumes the retry budget; `POST /jobs/{id}/retry` and `POST /jobs/{id}/cancel`
+- **Task lifecycle**: lease reaper and fencing; downstream tasks become `blocked` when an upstream task fails; startup recovery consumes the retry budget; `POST /jobs/{id}/retry` and `POST /jobs/{id}/cancel`
 - **Artifact-level fencing (staging + promotion)**: each attempt writes to its private staging file
   (`<name>.staging-<attempt>-<id>`); it becomes the final artifact only through `ArtifactStaging.promote()`,
   which `os.replace`es it after the repo confirms — inside one `BEGIN IMMEDIATE` transaction — that the task is
   still held by the same worker/attempt (`with_task_lease` / `publish_task_artifacts`). The intended guarantee
   is that a stale attempt cannot overwrite a newer attempt's artifact; rejected attempts are cleaned up.
-  Lease identity/stop-rollback edge cases are still under fix (see Verification status).
+  Lease identity ABA, stop/drain tuple-fenced rollback and promotion-error convergence are covered by the P1 re-verification (see Verification status).
 - **Canonical translation checkpoint**: the runtime passes the stable canonical checkpoint path to the
   translator while the SRT itself is staged, so a retried attempt resumes from batches already committed
   instead of re-translating; the checkpoint is only promoted together with the artifact.
-  Wired into the runtime, but still **pending final acceptance**: checkpoint ownership / lease-identity
-  fencing edge cases remain under fix.
+  Checkpoint ownership is bound to the frozen lease identity; the P1 re-verification covers the original
+  outside-lock-write and dynamic-identity counterexamples.
 - **Correctness**: `/jobs/by-path` returns 200 again; DAG is rejected at enqueue when it has no ASR stage, two ASR stages, no `extract` dependency or `translate` without an ASR dependency
 - **wav contract**: ASR reads `artifacts/<job_id>/audio/<stem>.16k.wav`; missing wav → `missing_audio_artifact`
-- **Translation**: `parallel` default 2 (was 16), `max_chars`, `checkpoint_enabled`, `strict_ids`; per-batch checkpoint resume (fencing edge case under fix); 4xx never retried; `Idempotency-Key`; atomic `zh.srt`
+- **Translation**: `parallel` default 2 (was 16), `max_chars`, `checkpoint_enabled`, `strict_ids`; per-batch checkpoint resume; 4xx never retried; `Idempotency-Key`; atomic `zh.srt`; real copyback sink with cross-FS + symlink-swap coverage
 - **Resources**: in-process model cache + semaphore (`model_cache_size`, `model_parallelism`)
 - **Security**: `require_token`, `allow_placeholder_token`, `docs_enabled`, `allowed_video_roots`, `allowed_copy_back_roots`, `bind_host/bind_port`; constant-time token comparison
 - **Observability**: `/healthz`, `/readyz`, `/metrics`, request-id logging, 5-minute queue throughput
-- **Delivery (not complete)**: CI workflow added (first remote run failed at the lock check due an implicit host TUNA mirror; lock normalized to public PyPI, rerun pending), tracked `uv.lock`, real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed; source merge, two green remote CI runs and v0.5.0 tag are still owned by the release parent
+- **Delivery**: CI workflow added; run 3 (39996457310 @ `2623545`) is green; the second green run follows this documentation commit. Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. Source merge and the `v0.5.0` tag remain with the release parent
 
 ### Planned
 
@@ -379,19 +392,20 @@ installed. No paid LLM request was sent during this verification pass.
 | Lock graph equivalence | passed locally | child 144 and root 143 packages; versions/sdist+wheel hashes/dependency graph unchanged (only source URLs/size metadata normalized) |
 | CI CPU torch override | passed locally | temp-copy lock/dry-run resolves `torch/torchaudio==2.8.0+cpu`, zero `nvidia-*` installs |
 | Bootstrap smoke (explicit token + missing model) | passed locally | wrong token 401; queue/health 200; `/readyz` 503; model dir not created |
-| Full pytest suite | passed locally | 527 passed, 5 deselected in 37.73s (2026-10-23 23:29) |
-| Remote CI | **first run failed; rerun pending** | run 39981535390 @ `bba96a0` failed at `uv lock --check` because the lock used a host-only TUNA mirror; lock normalized to public PyPI, no green run yet |
+| Full pytest suite | passed locally | 532 passed, 5 deselected in 41.13s (2026-10-24, fresh basetemp) |
+| Seven P1s (copyback sink, checkpoint identity, finally compare-and-remove, stop/drain tuple-fenced rollback, promotion-error convergence, atomic fenced single-write, worker boot nonce ABA) | **implemented + independently re-verified** | original real-SQLite/file counterexamples re-run; cross-FS `run_translate` fake-HTTP copyback and symlink-swap during copy both pass |
+| Remote CI | **run 3 green; second green pending** | run 39981535390 @ `bba96a0`: lock check failed (host-only TUNA mirror); run 39995654486 @ `66678d0`: lock check passed, 2 clean-runner tests failed (service.log creation order, script-mode wav check before ffprobe); run [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310) @ `2623545`: **success**. Second green run follows this documentation commit (URL to be filled by parent) |
 | Real 2-hour E2E | **not verified** | 4 configured `/srv/media/...` paths missing; `/srv/media/jellyfin` empty; only 30s/180s samples |
 | GPU memory peak | **not verified** | `nvidia-smi` exit 255, `NVML GPU access blocked by OS` |
 | Provider-side token rotation | **not done / no evidence** | operator action; local deletion/ignore is not revocation |
-| Final v0.5.0 acceptance | **pending** | service-mode copy-back sink, lease identity/fencing, promotion-error handling still under fix |
+| v0.5.0 tag/release | **pending (parent)** | implementation/P1 acceptance complete; tag created by release parent after the second green run |
 
 ## Known issues
 
 - The ruff baseline (`E9` + `F`) still reports findings on pre-existing modules; CI only enforces a syntax gate.
 - `pyproject.toml` keeps `prometheus-client` in the main dependencies for `/metrics`; if the package is missing at runtime, `/metrics` must degrade gracefully instead of breaking the app.
-- **v0.5.0 is not accepted yet**: service-mode copy-back has no real sink, and lease identity / stop-rollback /
-  checkpoint-fencing / promotion-error P1s are still under fix. Do not cite the local test count as final acceptance.
+- **v0.5.0 tag / second green run still pending**: implementation and the seven P1s are complete and independently
+  re-verified, but the release tag is created by the parent after the documentation-commit CI run.
 - End-to-end acceptance on a real 2-hour sample (wall-clock per stage, request counts, GPU memory peaks,
   `kill -9` resume) is **not yet verified**. Re-checked 2026-10-23: the four paths in
   `tests/e2e/video_paths.txt` under `/srv/media/jellyfin/...` are all missing, `/srv/media/jellyfin` is empty,
