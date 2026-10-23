@@ -51,6 +51,13 @@ gpu = [
 torch = [{ index = "pytorch-cu128" }]
 torchaudio = [{ index = "pytorch-cu128" }]
 
+# 显式默认源，避免依赖开发机 ~/.config/uv/uv.toml 或 UV_INDEX 的隐式镜像配置；
+# CI runner 无这些环境时，普通包必须稳定解析到公共 PyPI（files.pythonhosted.org）。
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
