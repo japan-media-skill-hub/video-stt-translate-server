@@ -4,15 +4,18 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-> **发布状态（2026-10-24）：v0.5.0 实现、P1 验收与远端 CI 验收完成；tag 待父创建。**
+> **发布状态（2026-10-24）：v0.5.0 实现、P1 验收、远端 CI 与发布交付完成。**
 > 远端 CI 历史：首次 [run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
 > （`bba96a0`）在提交锁校验失败：`uv.lock` 引用开发机专属 TUNA 镜像；第二次
 > [run 39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
-> （`66678d0`）锁校验通过，但两个 clean-runner 用例失败。随后**连续两个绿色提交**：
+> （`66678d0`）锁校验通过，但两个 clean-runner 用例失败。随后**连续三个绿色提交**：
 > `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)，
-> `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)。
+> `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)，
+> `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)
+> （push feature/main/tag 触发的 39997946922 / 39997927908 也同为该提交成功）。
 > 七项 P1 已由官方实施代理修复，并由 Sol 用原真 SQLite/文件反例及跨 FS copyback、copy 期间 symlink 替换
-> 两路径独立复验关闭。`v0.5.0` tag 仍待父创建；真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据。
+> 两路径独立复验关闭。annotated `v0.5.0` tag 已 push（tag object `6732f9c`，peeled `c88cc80`），
+> 父将把它重指到本次最终文档提交；真实 2 小时 / GPU 验收与供应商侧 token 轮换仍无证据。
 > 详见[验证状态](#验证状态)。
 
 ## 项目定位
@@ -295,7 +298,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` 在每次 push / pull request 上运行。**连续两个发布提交均已绿**：
+`.github/workflows/ci.yml` 在每次 push / pull request 上运行。**连续三个发布提交均已绿**：
 
 - [run 39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
   （`bba96a0`）：`uv lock --check` 失败，原因是 `uv.lock` 引用开发机专属 TUNA 镜像；
@@ -306,9 +309,14 @@ WHISPER_STT_REAL_MEDIA=1 \
   （`2623545`）：**成功**。该提交让 `service.log` 立即创建，并在任何 ffprobe 调用前拒绝视频输入；
   committed CI 仍先跑 CPU 子集再跑完整套件；
 - [run 39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)
-  （`5e67c7b`）：**成功**，第二个连续绿色提交。
+  （`5e67c7b`）：**成功**，第二个连续绿色提交；
+- [run 39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)、
+  [39997946922](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997946922)、
+  [39997927908](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997927908)
+  （`c88cc80`）：全部**成功**（feature/main/tag push 各触发一次），第三个连续绿色提交。
 
-绿色序列：`2623545` → 39996457310；`5e67c7b` → 39997343133。本地检查补充而不是替代这些远端 run。
+绿色序列：`2623545` → 39996457310；`5e67c7b` → 39997343133；`c88cc80` → 39997953791
+（另有 39997946922/39997927908）。本地检查补充而不是替代这些远端 run。
 
 - `secret-scan`：`.github/scripts/secret_scan.sh` 在纳入跟踪的文件含真实 `sk-…` / `hf_…` / `ghp_…` / `AIza…` 令牌，
   或提交了 `hf-token.md` 一类密钥文件时直接失败。令牌必须落在词边界上，因此 `task-<长ID>` 这类标识符不会误报；
@@ -335,7 +343,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 - [x] `v0.3.0`：WhisperX 阶段、显式 DAG E2E、确定性退出日志、中断续跑增强。
 - [x] `v0.4.0`：全局 API 鉴权、安全 drain 停机、分轮停机 E2E、小时级 artifact 清理调度。
 - [x] `v0.5.0`：可靠性与翻译链路加固——任务生命周期闭环（租约心跳/回收/fencing/级联/有界停机）、入队即校验 DAG 语义、ASR wav 契约、retry/cancel 接口、翻译并发上限 2 + 按批检查点续跑、产物原子写、模型缓存与并发上限、安全 fail-closed 默认值 + 路径白名单、结构化日志 + 健康检查/指标、CI + 锁文件 + 密钥治理
-  - tag/发布证据见[验证状态](#验证状态)：连续绿色提交 `2623545` → 39996457310、`5e67c7b` → 39997343133；`v0.5.0` tag 由父创建。
+  - tag/发布证据见[验证状态](#验证状态)：连续绿色提交 `2623545` → 39996457310、`5e67c7b` → 39997343133、`c88cc80` → 39997953791；annotated `v0.5.0` tag object `6732f9c`（peeled `c88cc80`）已 push，父将重指到本次最终文档提交。
 
 ### 相比 v0.4.0 的增量
 
@@ -354,7 +362,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 - **资源**：进程内模型缓存 + 信号量（`model_cache_size`、`model_parallelism`）
 - **安全**：`require_token`、`allow_placeholder_token`、`docs_enabled`、`allowed_video_roots`、`allowed_copy_back_roots`、`bind_host/bind_port`；token 常量时间比较
 - **可观测性**：`/healthz`、`/readyz`、`/metrics`、request-id 日志、队列 5 分钟吞吐
-- **交付**：新增 CI workflow；连续两个绿色提交（`2623545` → 39996457310、`5e67c7b` → 39997343133）。`uv.lock` 纳入跟踪（普通包公共 PyPI、torch explicit cu128）、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；源码整合/FF 与 `v0.5.0` tag 仍由发布父代理统一执行
+- **交付**：新增 CI workflow；连续三个绿色提交（`2623545` → 39996457310、`5e67c7b` → 39997343133、`c88cc80` → 39997953791；c88cc80 另有 39997946922/39997927908 成功）。`uv.lock` 纳入跟踪（普通包公共 PyPI、torch explicit cu128）、真实媒体用例迁到 `tests/manual`、删除 `docs/hf-token.md`、删除空 `.venv`；`main` 已 FF 到 `c88cc80`，annotated `v0.5.0` tag（object `6732f9c`，peeled `c88cc80`）已 push，父将重指到最终文档提交
 
 ### 规划中
 
@@ -380,17 +388,17 @@ WHISPER_STT_REAL_MEDIA=1 \
 | 启动冒烟（显式 token + 缺失模型） | 本地通过 | 错误 token 401；queue/health 200；`/readyz` 503；未创建 model 目录 |
 | 全量 pytest | 本地通过 | 532 passed / 5 deselected，41.13s（2026-10-24，全新 basetemp） |
 | 七项 P1（copyback sink、checkpoint 固定身份、finally compare-and-remove、stop/drain tuple-fenced rollback、promotion 异常收敛、atomic fenced 单写、worker boot nonce 防 ABA） | **已实现并独立复验** | 原真 SQLite/文件反例重跑通过；跨 FS `run_translate` fake-HTTP copyback 与 copy 期间 symlink 替换两路径通过 |
-| 远端 CI | **连续两个绿色提交** | 失败：run 39981535390 @ `bba96a0`（宿主机 TUNA 锁）、run 39995654486 @ `66678d0`（service.log 创建顺序、脚本 wav 校验在 ffprobe 之后）。绿色：`2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)；`5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133) |
+| 远端 CI | **连续三个绿色提交** | 失败：run 39981535390 @ `bba96a0`（宿主机 TUNA 锁）、run 39995654486 @ `66678d0`（service.log 创建顺序、脚本 wav 校验在 ffprobe 之后）。绿色：`2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)；`5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)；`c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)，另有 39997946922/39997927908 同为成功 |
 | 真实 2 小时 E2E | **未验证** | `/srv/media/...` 4 条路径都不存在；`/srv/media/jellyfin` 为空；只有 30s/180s 样本 |
 | GPU 显存峰值 | **未验证** | `nvidia-smi` 退出 255，`NVML GPU access blocked by OS` |
 | 供应商侧 token 轮换 | **未完成 / 无证据** | 属于外部操作；本地删除/忽略不等于撤销 |
-| v0.5.0 tag/发布 | **待父完成** | 实现/P1 与连续两个绿色 CI 已完成；tag 由父创建 |
+| v0.5.0 tag/发布 | **已 push；父将重指** | annotated tag object `6732f9c`，peeled `c88cc80`；父将重指到本次最终文档提交 |
 
 ## 已知问题
 
 - ruff 基线（`E9` + `F`）在存量模块上仍有告警；CI 只做语法门禁。
 - `pyproject.toml` 为主依赖引入了 `prometheus-client`（`/metrics` 需要）；若运行环境缺少该包，`/metrics` 应优雅降级而不能拖垮应用。
-- **v0.5.0 tag 仍待完成**：实现、七项 P1 与连续两个绿色 CI 已完成；release tag 由父在 FF/同步后创建。
+- **v0.5.0 tag 重指**：annotated tag 已 push（object `6732f9c`，peeled `c88cc80`）；父将重指到最终文档提交。历史 `v0.4.0` tag 也已补 push 到 `b029d07`。
 - 真实 2 小时样本端到端验收（各阶段墙钟、请求数、显存峰值、`kill -9` 续跑）**尚未验证**。
   2026-10-23 复核：`tests/e2e/video_paths.txt` 的 4 条 `/srv/media/jellyfin/...` 路径仍全部不存在，
   `/srv/media/jellyfin` 为空；本机只有 30s / 180s 样本；`nvidia-smi` 退出 255 并报
