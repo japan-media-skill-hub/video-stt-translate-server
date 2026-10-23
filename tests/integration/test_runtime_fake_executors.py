@@ -229,6 +229,18 @@ class FakeExecutors:
         with self.lock:
             return [c for c in self.calls if c["stage"] == stage]
 
+    def has_started(self, key: str) -> bool:
+        """返回某次执行器调用是否已进入 fake 实现（started 事件已置位）。
+
+        DB 中的 claimed 只说明任务被领取，不能证明执行器已经取到测试的
+        hang Event；`_maybe_hang` 先取事件再置位 started，因此必须等 started
+        置位才能断言“旧执行器确实被本用例的 Event 卡住”。
+        """
+
+        with self.lock:
+            started = self.starts.get(key)
+        return started is not None and started.is_set()
+
     def clear(self) -> None:
         """清空调用记录与失败设置（重启模拟时复用同一 fake）。"""
 
@@ -743,6 +755,11 @@ def test_restart_recovery_counts_attempt(stack: Stack, tmp_path: Path) -> None:
     runtime = stack.new_runtime()
     hang = threading.Event()
     stack.fake.hang_events["extract"] = hang
+    # 本用例把旧 runtime 当作“已崩溃进程”：真实崩溃后它的 reaper 不会继续运行。
+    # 若保留旧 reaper，旧租约可能在 restart 前（lease_timeout_sec=2s）被它自行
+    # 回收，startup recovery 就会看到 0 条 claimed，与本用例要验证的 A.5 恢复
+    # 语义无关。这里只停用旧 runtime 的 reaper，new runtime 仍使用正常 reaper。
+    runtime._reaper_loop = lambda: None  # type: ignore[method-assign]
     original_start = runtime_module.FencedLease.start
 
     def start_without_heartbeat(lease) -> None:
@@ -761,12 +778,20 @@ def test_restart_recovery_counts_attempt(stack: Stack, tmp_path: Path) -> None:
             lambda: stack.tasks(job_id)["extract"]["status"] == "claimed",
             description="extract claimed before crash",
         )
-        claimed_attempt = int(stack.tasks(job_id)["extract"]["attempt"])
+        extract_task = stack.tasks(job_id)["extract"]
+        claimed_attempt = int(extract_task["attempt"])
+        hang_key = f"extract:{extract_task['task_id']}"
 
-        # 模拟“进程消失”：不调用 stop（stop 会回滚本进程 claimed），
-        # 直接以新的 runtime 做启动恢复。
-        stack.fake.hang_events.pop("extract", None)
-        hang.set()
+        # claimed 只是 DB 状态；必须等旧执行器真正进入 `_maybe_hang`：它先取走
+        # hang_events 里的 Event，再置位 started。此后旧执行器只能由该 Event 放行。
+        wait_until(
+            lambda: stack.fake.has_started(hang_key),
+            description="old extract entered controlled hang",
+        )
+        assert stack.tasks(job_id)["extract"]["status"] == "claimed"
+
+        # 模拟“进程消失”：不调用 stop（stop 会回滚本进程 claimed），直接以新的
+        # runtime 做启动恢复。此时旧执行器仍 hang，任务必须仍是 claimed。
         stack.fake.clear()
 
         restarted = stack.new_runtime()
@@ -776,6 +801,11 @@ def test_restart_recovery_counts_attempt(stack: Stack, tmp_path: Path) -> None:
             lambda: int(stack.tasks(job_id)["extract"]["attempt"]) > claimed_attempt,
             description="attempt incremented by startup recovery",
         )
+
+        # 恢复语义已确认后才放行旧执行器：先移除同名 hang 映射（避免重启后的新
+        # attempt 继续复用旧 Event），再 set 旧 Event 放行旧调用。
+        stack.fake.hang_events.pop("extract", None)
+        hang.set()
         wait_until(
             lambda: stack.job_status(job_id) == "succeeded",
             description="job succeeded after restart",
