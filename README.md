@@ -4,17 +4,16 @@ A local movie translation pipeline that combines `ffmpeg`, `Whisper/WhisperX`, a
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-> **Release status (2026-10-24): v0.5.0 implementation and P1 acceptance complete; tag/release evidence pending.**
+> **Release status (2026-10-24): v0.5.0 implementation, P1 acceptance and remote CI acceptance complete; tag pending.**
 > Remote CI history: run [39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
 > (`bba96a0`) failed at the committed-lock check because the lock referenced a host-only TUNA mirror; run
 > [39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
-> (`66678d0`) passed the lock check but hit two clean-runner test issues; run
-> [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
-> (`2623545`) **succeeded**. The second green run is triggered by this documentation commit; its URL is to be
-> filled in by the release parent. The seven P1s have been implemented and independently re-verified by Sol
-> with the original real-SQLite/file counterexamples and the cross-FS copyback/symlink-swap tests. The
-> `v0.5.0` tag is still pending. Real 2-hour/GPU acceptance and provider-side token rotation remain unverified.
-> See [Verification status](#verification-status).
+> (`66678d0`) passed the lock check but hit two clean-runner test issues. Then **two consecutive green commits**:
+> `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
+> and `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133).
+> The seven P1s have been implemented and independently re-verified by Sol with the original real-SQLite/file
+> counterexamples and the cross-FS copyback/symlink-swap tests. The `v0.5.0` tag is still pending. Real
+> 2-hour/GPU acceptance and provider-side token rotation remain unverified. See [Verification status](#verification-status).
 
 ## Project purpose
 
@@ -302,8 +301,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push / pull request. **Run 3 is green; the second green run is
-pending on this documentation commit**:
+`.github/workflows/ci.yml` runs on every push / pull request. **Two consecutive release commits are green**:
 
 - run [39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
   (`bba96a0`): failed at `uv lock --check` because the lock referenced a host-only TUNA mirror;
@@ -311,11 +309,13 @@ pending on this documentation commit**:
   (`66678d0`): lock check passed; two clean-runner tests failed (service.log creation order and
   script-mode wav rejection happening after an ffprobe probe);
 - run [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)
-  (`2623545`): **success**. That commit creates `service.log` immediately and rejects video input before any
-  ffprobe call; the committed CI still runs the CPU subset followed by the full suite.
+  (`2623545`): **success**; that commit creates `service.log` immediately and rejects video input before any
+  ffprobe call. The committed CI still runs the CPU subset followed by the full suite;
+- run [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)
+  (`5e67c7b`): **success**, the second consecutive green commit.
 
-The second green run is triggered by this documentation commit; its URL is to be filled in by the release
-parent. Local checks below are not a substitute for the second green remote run.
+Green sequence: `2623545` → 39996457310; `5e67c7b` → 39997343133. Local checks below complement, not
+replace, these runs.
 
 - `secret-scan`: `.github/scripts/secret_scan.sh` fails if a tracked file contains a real
   `sk-…` / `hf_…` / `ghp_…` / `AIza…` token or a key file such as `hf-token.md` is committed.
@@ -345,7 +345,7 @@ with **zero** `nvidia-*` packages.
 - [x] `v0.3.0`: WhisperX stage, explicit DAG E2E, deterministic E2E exits, interrupted-run recovery
 - [x] `v0.4.0`: global API token auth, graceful drain shutdown, round-based shutdown E2E, and hourly artifact cleanup scheduler
 - [x] `v0.5.0`: reliability & translation hardening — task lifecycle closure (lease heartbeat/reaper/fencing/cascade/bounded drain), enqueue-time DAG semantics, wav contract for ASR, retry/cancel APIs, translation concurrency cap 2 with per-batch checkpoint resume, atomic artifact writes, model cache + parallelism limits, security fail-closed defaults with path allow-lists, structured logging + health/readiness/metrics, CI + lockfile + secret hygiene
-  - Tag/release evidence is tracked in [Verification status](#verification-status): run 39996457310 is green; the second green run follows this documentation commit, and the `v0.5.0` tag is created by the release parent.
+  - Tag/release evidence is tracked in [Verification status](#verification-status): consecutive green commits `2623545` → 39996457310 and `5e67c7b` → 39997343133; the `v0.5.0` tag is created by the release parent.
 
 ### Delta since v0.4.0
 
@@ -367,7 +367,7 @@ with **zero** `nvidia-*` packages.
 - **Resources**: in-process model cache + semaphore (`model_cache_size`, `model_parallelism`)
 - **Security**: `require_token`, `allow_placeholder_token`, `docs_enabled`, `allowed_video_roots`, `allowed_copy_back_roots`, `bind_host/bind_port`; constant-time token comparison
 - **Observability**: `/healthz`, `/readyz`, `/metrics`, request-id logging, 5-minute queue throughput
-- **Delivery**: CI workflow added; run 3 (39996457310 @ `2623545`) is green; the second green run follows this documentation commit. Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. Source merge and the `v0.5.0` tag remain with the release parent
+- **Delivery**: CI workflow added; two consecutive green commits (`2623545` → 39996457310, `5e67c7b` → 39997343133). Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. Source merge/FF and the `v0.5.0` tag remain with the release parent
 
 ### Planned
 
@@ -394,18 +394,18 @@ installed. No paid LLM request was sent during this verification pass.
 | Bootstrap smoke (explicit token + missing model) | passed locally | wrong token 401; queue/health 200; `/readyz` 503; model dir not created |
 | Full pytest suite | passed locally | 532 passed, 5 deselected in 41.13s (2026-10-24, fresh basetemp) |
 | Seven P1s (copyback sink, checkpoint identity, finally compare-and-remove, stop/drain tuple-fenced rollback, promotion-error convergence, atomic fenced single-write, worker boot nonce ABA) | **implemented + independently re-verified** | original real-SQLite/file counterexamples re-run; cross-FS `run_translate` fake-HTTP copyback and symlink-swap during copy both pass |
-| Remote CI | **run 3 green; second green pending** | run 39981535390 @ `bba96a0`: lock check failed (host-only TUNA mirror); run 39995654486 @ `66678d0`: lock check passed, 2 clean-runner tests failed (service.log creation order, script-mode wav check before ffprobe); run [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310) @ `2623545`: **success**. Second green run follows this documentation commit (URL to be filled by parent) |
+| Remote CI | **two consecutive green commits** | failures: run 39981535390 @ `bba96a0` (host-only TUNA lock) and run 39995654486 @ `66678d0` (service.log creation order, script-mode wav check before ffprobe). Green: `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310); `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133) |
 | Real 2-hour E2E | **not verified** | 4 configured `/srv/media/...` paths missing; `/srv/media/jellyfin` empty; only 30s/180s samples |
 | GPU memory peak | **not verified** | `nvidia-smi` exit 255, `NVML GPU access blocked by OS` |
 | Provider-side token rotation | **not done / no evidence** | operator action; local deletion/ignore is not revocation |
-| v0.5.0 tag/release | **pending (parent)** | implementation/P1 acceptance complete; tag created by release parent after the second green run |
+| v0.5.0 tag/release | **pending (parent)** | implementation/P1 and two consecutive green CI runs complete; tag created by release parent |
 
 ## Known issues
 
 - The ruff baseline (`E9` + `F`) still reports findings on pre-existing modules; CI only enforces a syntax gate.
 - `pyproject.toml` keeps `prometheus-client` in the main dependencies for `/metrics`; if the package is missing at runtime, `/metrics` must degrade gracefully instead of breaking the app.
-- **v0.5.0 tag / second green run still pending**: implementation and the seven P1s are complete and independently
-  re-verified, but the release tag is created by the parent after the documentation-commit CI run.
+- **v0.5.0 tag still pending**: implementation, the seven P1s and two consecutive green CI runs are complete;
+  the release tag is created by the parent.
 - End-to-end acceptance on a real 2-hour sample (wall-clock per stage, request counts, GPU memory peaks,
   `kill -9` resume) is **not yet verified**. Re-checked 2026-10-23: the four paths in
   `tests/e2e/video_paths.txt` under `/srv/media/jellyfin/...` are all missing, `/srv/media/jellyfin` is empty,
