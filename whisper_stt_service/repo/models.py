@@ -24,6 +24,8 @@ class ClaimedTask:
     task_id: str
     job_id: str
     stage: str
+    # 领取时写入的 attempt 值，用于后续心跳/写回的 fencing 校验。
+    attempt: int = 0
 
 
 @dataclass
@@ -43,3 +45,7 @@ class TaskExecutionContext:
     log_dir: str
     log_file: str
     task_config: dict
+    # SPEC B.3：每阶段唯一写者。入队时写入 task_config["io"]，运行时按此执行；
+    # 为空表示历史 job 未登记 io，调用方应回退到 video_path/output_*_path 规则。
+    input_path: str = ""
+    output_path: str = ""

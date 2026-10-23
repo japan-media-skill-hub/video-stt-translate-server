@@ -32,6 +32,8 @@ class TimeoutSettings:
     stt_whisperx_timeout_sec: int
     translate_timeout_sec: int
     lease_timeout_sec: int
+    # A.6：drain 请求后等待在途任务结束的上限，超时强制回滚本进程 claimed 并退出。
+    drain_timeout_sec: int = 300
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,13 @@ class RuntimeSettings:
     artifact_cleanup_interval_sec: int
     artifact_cleanup_statuses: tuple[str, ...]
     model_path: Path
+    # A.5：启动恢复是否消耗一次重试预算（false 仅用于调试，保持旧行为）。
+    recovery_counts_as_attempt: bool = True
+    # SPEC D：进程内模型缓存容量（0 = 不缓存，仅调试）与单模型并发上限。
+    model_cache_size: int = 2
+    model_parallelism: int = 1
+    # F：SQLite 连接是否启用 WAL（网络盘等场景可关闭，回退 DELETE）。
+    sqlite_wal_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -102,9 +111,80 @@ class SttWhisperxSettings:
 
 @dataclass(frozen=True)
 class SecuritySettings:
-    """API 全局访问控制配置。"""
+    """API 全局访问控制配置。
+
+    同时覆盖暴露面参数（SPEC H / D4，全部可配置、默认安全）。
+
+    - api_token：空 = 鉴权关闭（启动 WARN）。
+    - require_token：True 且 token 为空 → 启动失败（fail-closed）。
+    - allow_placeholder_token：False 时占位 token（含 `<>` 或示例值）→ 启动失败。
+    - docs_enabled：关闭时 /docs、/redoc、/openapi.json 返回 404；开启仍受 token 保护。
+    - allowed_video_roots / allowed_copy_back_roots：非空时路径必须 resolve 后位于其下。
+    - bind_host / bind_port：供启动脚本读取（默认仅监听回环地址）。
+    """
 
     api_token: str
+    require_token: bool = True
+    allow_placeholder_token: bool = False
+    docs_enabled: bool = False
+    allowed_video_roots: tuple[str, ...] = ()
+    allowed_copy_back_roots: tuple[str, ...] = ()
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 18000
+
+
+@dataclass(frozen=True)
+class ObservabilitySettings:
+    """可观测性配置（SPEC G，对应 [observability] 段）。
+
+    - log_level：应用与 uvicorn logger 等级，非法值回退 INFO。
+    - log_jsonl：True 时落盘的 service.log 每行一个 JSON 对象。
+    - metrics_enabled：False 时不注册 /metrics（返回 404），其余观测能力保留。
+    """
+
+    log_level: str = "INFO"
+    log_jsonl: bool = False
+    metrics_enabled: bool = True
+
+
+@dataclass(frozen=True)
+class TranslationSettings:
+    """翻译链路配置（SPEC C / D2，对应 [translation] 段）。
+
+    全部键都有默认值，旧配置缺键可直接加载；`parallel` 默认 2（D2 拍板）。
+    `timeout_sec` 是服务计划内的单批 HTTP 超时，`retry` 是批次重试次数。
+    """
+
+    parallel: int = 2
+    batch_size: int = 200
+    max_chars: int = 12000
+    chunk_minutes: int = 20
+    timeout_sec: int = 240
+    retry: int = 10
+    request_interval: float = 1.0
+    disable_proxy: bool = True
+    copy_back: str = "__video_dir__"
+    checkpoint_enabled: bool = True
+    strict_ids: bool = False
+    progress_ttl_sec: int = 604800
+
+    def as_job_config(self) -> dict[str, object]:
+        """转成 run_translate 的 job_config 形态（作为 stage 生效默认值）。"""
+
+        return {
+            "parallel": self.parallel,
+            "batch_size": self.batch_size,
+            "max_chars": self.max_chars,
+            "chunk_minutes": self.chunk_minutes,
+            "timeout_sec": self.timeout_sec,
+            "retry": self.retry,
+            "request_interval": self.request_interval,
+            "disable_proxy": self.disable_proxy,
+            "copy_back": self.copy_back,
+            "checkpoint_enabled": self.checkpoint_enabled,
+            "strict_ids": self.strict_ids,
+            "progress_ttl_sec": self.progress_ttl_sec,
+        }
 
 
 @dataclass(frozen=True)
@@ -118,6 +198,9 @@ class Settings:
     stt: SttSettings
     stt_whisperx: SttWhisperxSettings
     security: SecuritySettings
+    # 新增段带默认值：旧测试/旧调用方直接构造 Settings 时无需改动。
+    observability: ObservabilitySettings = ObservabilitySettings()
+    translation: TranslationSettings = TranslationSettings()
 
 
 # 启动前必须存在的配置项（按 section/option 列举）。
@@ -218,6 +301,9 @@ def load_settings(config_path: Path) -> Settings:
         ),
         translate_timeout_sec=cp.getint("timeouts", "translate_timeout_sec"),
         lease_timeout_sec=cp.getint("timeouts", "lease_timeout_sec"),
+        drain_timeout_sec=max(
+            cp.getint("timeouts", "drain_timeout_sec", fallback=300), 1
+        ),
     )
     retry = RetrySettings(
         extract_max_retries=cp.getint("retry", "extract_max_retries"),
@@ -263,6 +349,15 @@ def load_settings(config_path: Path) -> Settings:
         model_path=Path(
             cp.get("runtime", "model_path", fallback="models/faster-whisper-small")
         ),
+        recovery_counts_as_attempt=cp.getboolean(
+            "runtime", "recovery_counts_as_attempt", fallback=True
+        ),
+        sqlite_wal_enabled=cp.getboolean(
+            "runtime", "sqlite_wal_enabled", fallback=True
+        ),
+        # SPEC D：缓存容量 0 = 不缓存（仅调试）；并发上限至少 1。
+        model_cache_size=max(cp.getint("runtime", "model_cache_size", fallback=2), 0),
+        model_parallelism=max(cp.getint("runtime", "model_parallelism", fallback=1), 1),
     )
     stt = SttSettings(
         device=cp.get("stt", "device", fallback="auto"),
@@ -334,9 +429,9 @@ def load_settings(config_path: Path) -> Settings:
             "stt_whisperx", "local_files_only", fallback=True
         ),
     )
-    security = SecuritySettings(
-        api_token=cp.get("security", "api_token", fallback="").strip(),
-    )
+    security = _load_security_settings(cp)
+    observability = _load_observability_settings(cp)
+    translation = _load_translation_settings(cp)
     return Settings(
         workers=workers,
         timeouts=timeouts,
@@ -345,4 +440,129 @@ def load_settings(config_path: Path) -> Settings:
         stt=stt,
         stt_whisperx=stt_whisperx,
         security=security,
+        observability=observability,
+        translation=translation,
+    )
+
+
+def _split_path_list(raw: str | None) -> tuple[str, ...]:
+    """把逗号分隔的路径白名单拆成去空白的元组（保持原有顺序）。"""
+
+    return tuple(
+        token.strip() for token in str(raw or "").split(",") if token.strip()
+    )
+
+
+def _load_security_settings(cp: configparser.ConfigParser) -> SecuritySettings:
+    """解析 [security] 段；缺省值即安全默认值（SPEC H fail-closed）。
+
+    - require_token 默认 true、allow_placeholder_token 默认 false、docs 默认关闭；
+    - bind_host 默认 127.0.0.1（公网部署必须显式修改并前置反向代理）；
+    - bind_port 非法时回退 18000。
+    """
+
+    port_raw = cp.get("security", "bind_port", fallback="18000").strip()
+    try:
+        bind_port = int(port_raw)
+    except ValueError:
+        bind_port = 18000
+    if not (1 <= bind_port <= 65535):
+        bind_port = 18000
+    bind_host = cp.get("security", "bind_host", fallback="127.0.0.1").strip() or "127.0.0.1"
+    return SecuritySettings(
+        api_token=cp.get("security", "api_token", fallback="").strip(),
+        require_token=cp.getboolean("security", "require_token", fallback=True),
+        allow_placeholder_token=cp.getboolean(
+            "security", "allow_placeholder_token", fallback=False
+        ),
+        docs_enabled=cp.getboolean("security", "docs_enabled", fallback=False),
+        allowed_video_roots=_split_path_list(
+            cp.get("security", "allowed_video_roots", fallback="")
+        ),
+        allowed_copy_back_roots=_split_path_list(
+            cp.get("security", "allowed_copy_back_roots", fallback="")
+        ),
+        bind_host=bind_host,
+        bind_port=bind_port,
+    )
+
+
+def _load_observability_settings(cp: configparser.ConfigParser) -> ObservabilitySettings:
+    """解析 [observability] 段；缺段/缺键时使用安全且实用的默认值。"""
+
+    level = cp.get("observability", "log_level", fallback="INFO").strip().upper() or "INFO"
+    return ObservabilitySettings(
+        log_level=level,
+        log_jsonl=cp.getboolean("observability", "log_jsonl", fallback=False),
+        metrics_enabled=cp.getboolean("observability", "metrics_enabled", fallback=True),
+    )
+
+
+def _load_translation_settings(cp: configparser.ConfigParser) -> TranslationSettings:
+    """解析 [translation] 段（SPEC C 全键）；旧配置缺键即取默认值。
+
+    注意：并行度默认 2（D2 决策），旧配置里显式写的 `parallel = 16` 仍会被读成
+    16，需在发布说明中提示改为 2。
+    """
+
+    defaults = TranslationSettings()
+    return TranslationSettings(
+        parallel=max(cp.getint("translation", "parallel", fallback=defaults.parallel), 1),
+        batch_size=max(
+            cp.getint("translation", "batch_size", fallback=defaults.batch_size), 1
+        ),
+        max_chars=max(
+            cp.getint("translation", "max_chars", fallback=defaults.max_chars), 1
+        ),
+        chunk_minutes=max(
+            cp.getint("translation", "chunk_minutes", fallback=defaults.chunk_minutes), 1
+        ),
+        timeout_sec=max(
+            cp.getint("translation", "timeout", fallback=defaults.timeout_sec), 1
+        ),
+        retry=max(cp.getint("translation", "retry", fallback=defaults.retry), 0),
+        request_interval=max(
+            cp.getfloat(
+                "translation", "request_interval", fallback=defaults.request_interval
+            ),
+            0.0,
+        ),
+        disable_proxy=cp.getboolean(
+            "translation", "disable_proxy", fallback=defaults.disable_proxy
+        ),
+        copy_back=(
+            cp.get("translation", "copy_back", fallback=defaults.copy_back).strip()
+            or defaults.copy_back
+        ),
+        checkpoint_enabled=cp.getboolean(
+            "translation", "checkpoint_enabled", fallback=defaults.checkpoint_enabled
+        ),
+        strict_ids=cp.getboolean(
+            "translation", "strict_ids", fallback=defaults.strict_ids
+        ),
+        progress_ttl_sec=max(
+            cp.getint(
+                "translation", "progress_ttl_sec", fallback=defaults.progress_ttl_sec
+            ),
+            0,
+        ),
+    )
+
+
+def validate_startup_security(settings: Settings) -> None:
+    """启动期安全校验（fail-closed）：不满足则抛 SecurityError，由 bootstrap 拒绝启动。
+
+    规则（SPEC H）：
+    - require_token=true（默认）且 token 为空 → `api_token_missing`；
+    - allow_placeholder_token=false（默认）且 token 是占位值 → `api_token_placeholder`；
+    - token 为空且 require_token=false → 不报错（调用方显式承担风险，bootstrap 记录 WARN）。
+    """
+
+    # 延迟导入：core.security 仅依赖标准库，但保持 config 模块导入期无外部耦合。
+    from whisper_stt_service.core.security import validate_startup_token
+
+    validate_startup_token(
+        settings.security.api_token,
+        require_token=settings.security.require_token,
+        allow_placeholder_token=settings.security.allow_placeholder_token,
     )

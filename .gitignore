@@ -6,13 +6,25 @@
 __pycache__/
 *.py[cod]
 
+# Local virtualenv (strict rule: only /home/base/repo/video-stt-whisper-server/.venv is used)
+.venv/
+
 # Local output and media artifacts
 output/
 tmp/
 tests/e2e/video_paths.txt
-tests/unit/test_workers_real_media_inputs.py
+# 真实媒体用例已迁移到 tests/manual/test_real_media.py 并纳入版本跟踪，
+# 由 pytest 标记 + WHISPER_STT_REAL_MEDIA 环境开关控制是否执行。
 *.mp4
 *.wav
 *.srt
 *.progress.json
 config.ini
+
+# Local CodeGraph index
+.codegraph/
+.ruff_cache/
+
+# Local secrets (never commit real tokens / keys)
+*.token
+token.env

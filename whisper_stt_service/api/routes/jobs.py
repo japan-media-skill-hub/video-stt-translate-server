@@ -2,31 +2,49 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from whisper_stt_service.api.dependencies import get_progress_store, get_repo
 from whisper_stt_service.api.schemas import ArchiveJobReq, CreateJobReq
+from whisper_stt_service.core.security import SecurityError, resolve_video_path
 
 
 router = APIRouter()
 
 
+def _security_session(repo) -> object:
+    """取出 repo 上配置的安全策略（无配置时用安全默认值）。"""
+
+    return getattr(repo, "security", None) or None
+
+
 @router.post("/jobs")
 def create_job(req: CreateJobReq, request: Request):
-    """创建 job：先校验视频路径，再写入 SQLite 队列。"""
+    """创建 job：先校验视频路径，再写入 SQLite 队列。
 
-    path = Path(req.video_path)
-    if not path.is_absolute() or not path.is_file():
-        raise HTTPException(status_code=400, detail="video_path_not_found")
+    校验为严格版（SPEC H）：绝对路径 / 存在 / 普通文件 / 扩展名白名单 /
+    allowed_video_roots 白名单 / strict resolve。
+    """
+
     repo = get_repo(request)
+    try:
+        # API 是对外信任边界：存在性/is_file/strict resolve/扩展名/白名单全量校验。
+        resolve_video_path(req.video_path, session=_security_session(repo))
+    except SecurityError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    except ValueError as exc:
+        # 历史行为兼容：非绝对路径/不存在此前统一返回 video_path_not_found。
+        raise HTTPException(status_code=400, detail="video_path_not_found") from exc
+    # SPEC G：把中间件解析出的 request_id 固化到 task 元数据，使任务日志与
+    # 本次 HTTP 请求可关联（无 DB 列变更）。中间件缺失时回退为空。
+    request_id = str(getattr(request.state, "request_id", "") or "").strip() or None
     try:
         result = repo.enqueue(
             video_path=req.video_path,
             language=req.language,
             dag=req.dag,
             job_config=req.job_config,
+            request_id=request_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -38,6 +56,18 @@ def create_job(req: CreateJobReq, request: Request):
         "plan_mode": result.plan_mode,
         "stages": result.stages,
     }
+
+
+@router.get("/jobs/by-path")
+def by_path(video_path: str, request: Request):
+    """按视频路径查询最近一条 job。
+
+    必须注册在 `/jobs/{job_id}` 之前，否则会被动态路由吞掉（恒 404）。
+    """
+
+    repo = get_repo(request)
+    item = repo.get_job_latest_by_path(video_path)
+    return {"video_path": video_path, "item": item}
 
 
 @router.get("/jobs/{job_id}")
@@ -83,13 +113,35 @@ def archive_job(job_id: str, req: ArchiveJobReq, request: Request):
         raise HTTPException(status_code=409, detail=detail) from exc
 
 
-@router.get("/jobs/by-path")
-def by_path(video_path: str, request: Request):
-    """按视频路径查询最近一条 job。"""
+@router.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, request: Request):
+    """重跑 failed job：把 failed/blocked 任务重置为 queued 并回写 job 状态。
+
+    仅 failed job 可重跑；历史非法 DAG 返回 409；不存在的 job 返回 404。
+    """
 
     repo = get_repo(request)
-    item = repo.get_job_latest_by_path(video_path)
-    return {"video_path": video_path, "item": item}
+    try:
+        return repo.retry_job(job_id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "job_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=409, detail=detail) from exc
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, request: Request):
+    """取消尚未开始的 job（所有任务 queued），并释放路径占用。"""
+
+    repo = get_repo(request)
+    try:
+        return repo.cancel_job(job_id)
+    except ValueError as exc:
+        detail = str(exc)
+        if detail == "job_not_found":
+            raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=409, detail=detail) from exc
 
 
 @router.get("/jobs")

@@ -3,6 +3,8 @@
 import subprocess
 
 from whisper_stt_service.executor.common import (
+    ExecutorCancelledError,
+    MissingAudioArtifactError,
     SrtEntry,
     _build_translate_messages,
     _split_entries_by_time_window,
@@ -21,6 +23,8 @@ from whisper_stt_service.executor.stt_whisperx import (
 from whisper_stt_service.executor.translate import run_translate
 
 __all__ = [
+    "ExecutorCancelledError",
+    "MissingAudioArtifactError",
     "SrtEntry",
     "_build_translate_messages",
     "_resolve_runtime",

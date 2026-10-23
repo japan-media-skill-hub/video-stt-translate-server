@@ -4,7 +4,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import logging
+
+import pytest
+
 from whisper_stt_service.executor.translate import run_translate
+
+
+@pytest.fixture(autouse=True)
+def _restore_logger_propagation():
+    """恢复 `whisper_stt_service` 的 propagate，避免其他用例 dictConfig 残留影响 caplog。"""
+
+    logger = logging.getLogger("whisper_stt_service")
+    saved = logger.propagate
+    logger.propagate = True
+    yield
+    logger.propagate = saved
 
 
 def test_translate_copy_back_defaults_to_video_dir(monkeypatch, tmp_path: Path) -> None:
@@ -103,15 +118,16 @@ def test_translate_copy_back_failure_only_warns(
         batch = kwargs["batch"]
         return {entry.index: f"zh-{entry.index}" for entry in batch}
 
-    def fake_copy2(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+    def fake_atomic_write(*_args, **_kwargs):  # type: ignore[no-untyped-def]
         raise PermissionError("readonly")
 
     monkeypatch.setattr(
         "whisper_stt_service.executor.translate._call_translate_api",
         fake_call_translate_api,
     )
+    # copy_back 改为原子写：注入写入失败以验证“仅告警、不导致阶段失败”。
     monkeypatch.setattr(
-        "whisper_stt_service.executor.translate.shutil.copy2", fake_copy2
+        "whisper_stt_service.executor.translate.atomic_write_text", fake_atomic_write
     )
 
     run_translate(

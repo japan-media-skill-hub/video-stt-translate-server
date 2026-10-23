@@ -1,0 +1,178 @@
+# CI：纯 CPU 环境验证（不安装 gpu group，不需要 ffmpeg / 模型 / 网络 / GPU）。
+#
+# - Python 3.10 + uv：`uv sync --group dev`（不装 gpu 组）；
+#   由于 whisperx 无条件传递依赖 torch，CI 会用 ci-cpu-sources.py 把 torch/torchaudio
+#   临时指向 PyTorch CPU 索引，因此本流水线**只执行 CPU** 且不安装 nvidia-* CUDA 运行时
+# - pytest 默认跳过 manual（真实模型/真实 LLM）与 e2e（需起服务 + 真实媒体）
+# - secret 扫描：阻止 sk-* / hf_* 等真实令牌与密钥文件入库（SPEC H）
+# - ruff check 为基线扫描（E9/F），存量代码提示不阻断，避免本批改动范围外大改
+#
+# 历史说明（保留原文，原注释不删除）：上面“ruff check 为基线扫描”是早期计划；
+# 当前流水线**不**使用 ruff 作为门禁，实际语法门禁是下方 “Python syntax check
+# (tracked files)” 步骤里的 compileall。ruff 仅保留在 dev 组供本地排查，原因见该步骤注释。
+# 当前实际门禁（2026-10-23 复核）：secret-scan + scanner 自测 → 提交锁一致性
+# （uv lock --check）→ CPU 源覆盖与 pytest（CPU）→ compileall → config.example.ini 启动冒烟。
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 默认不加载任何真实媒体 / 真实 LLM / GPU 依赖。
+  WHISPER_STT_REAL_MEDIA: ""
+
+jobs:
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 扫描纳入版本跟踪的文件（示例占位符 <...> / CHANGE_ME / YOUR_ 不会命中）。
+      - name: Scan tracked files for provider tokens
+        run: bash .github/scripts/secret_scan.sh
+
+      # 扫描器自身的正/负样本：真实的 key 形态必须命中，合法 task ID（…task-<长ID>）不得误报。
+      - name: Secret scanner self-test (true/false positives)
+        run: bash .github/scripts/secret_scan_selftest.sh
+
+  test:
+    name: pytest (python 3.10, cpu)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.10.5"
+          enable-cache: true
+
+      - name: Set up Python 3.10
+        run: uv python install 3.10
+
+      # 先验证提交进仓库的 pyproject.toml / uv.lock 一致（部署锁仍为 cu128 gpu 组）。
+      # 这一步只读检查，不安装依赖；CPU 覆盖在下一步才对 CI 临时工作副本生效。
+      - name: Verify committed lockfile is reproducible
+        run: uv lock --check --python 3.10
+
+      # SPEC I：Python 3.10 + uv sync --group dev，不装 gpu group。
+      #
+      # 但"不装 gpu group"≠"不装 GPU 依赖"：whisperx 无条件传递依赖 pyannote-audio -> torch，
+      # 且 [tool.uv.sources] 把 torch/torchaudio 钉在 pytorch-cu128。UV_TORCH_BACKEND=cpu
+      # 覆盖不了显式 sources（实测仍解析出 torch==2.8.0+cu128 + 14 个 nvidia-* 包），
+      # 所以这里用 .github/workflows/ci-cpu-sources.py 临时把源改为 PyTorch CPU 索引，
+      # 再 uv lock + uv sync。只影响 CI 运行环境，仓库里的 gpu 组与部署索引保持不变。
+      - name: Apply CPU-only torch sources (CI only)
+        run: |
+          python .github/workflows/ci-cpu-sources.py pyproject.toml
+          uv lock --python 3.10
+
+      - name: Sync dev dependencies (torch from CPU index)
+        run: uv sync --group dev --python 3.10
+
+      - name: Show resolved environment
+        run: |
+          uv --version
+          .venv/bin/python --version
+          .venv/bin/python -m pytest --version
+          uv pip list --python .venv/bin/python | grep -Ei '^(torch|torchaudio|whisperx|faster-whisper|httpx|prometheus-client|pytest) '
+
+      # CPU 可跑的测试子集：显式排除依赖 whisperx/faster-whisper 真实实现的文件
+      # （它们是 manual/e2e 之外的"重依赖"用例，这里用 CPU 版 torch 也会占用大量磁盘/时间）。
+      - name: Run unit tests (CPU subset)
+        run: |
+          .venv/bin/python -m pytest -q \
+            --ignore=tests/unit/test_executor_wav_contract.py \
+            --ignore=tests/unit/test_model_cache.py
+
+      # 默认跳过真实媒体（manual）与 E2E；此步骤跑完整测试集（含 whisperx 真实实现用例），
+      # 依赖上一步已安装的 CPU 版 torch。若仍超时，按 README「Known issues」记录为已知限制。
+      - name: Run full test suite (CPU torch)
+        run: .venv/bin/python -m pytest -q -p no:cacheprovider
+
+      # 语法门禁（python -m compileall）：纳入版本跟踪的 Python 文件若有语法错误则失败。
+      # 不使用 ruff 作为 CI 门禁（ruff 仍保留在 dev 组供本地使用）：存量代码仍有 pyflakes
+      # 告警，强制 ruff F 需要大范围改存量导入/变量，超出本批范围（SPEC I 允许 CI 仅跑 pytest）。
+      - name: Python syntax check (tracked files)
+        run: |
+          FILES=$(git ls-files -- '*.py')
+          if [ -z "$FILES" ]; then echo "no python files"; exit 0; fi
+          .venv/bin/python -m compileall -q $FILES
+
+      # 用 config.example.ini 装配应用，确认服务在纯 CPU 依赖下可构建（不起 uvicorn、不碰模型）。
+      #
+      # 约定：
+      # - 示例配置的安全默认（require_token=true + 空/占位 token）故意 fail-closed，
+      #   CI 不修改示例配置、也不把 require_token 关掉，而是显式给一个测试 token。
+      # - model_path **不创建**：模型缺失必须让 /readyz 返回 503，而不是被 mkdir 伪装成可用；
+      #   /healthz 只要求进程存活 + DB 可查询，应返回 200。
+      - name: Service smoke (build app from config.example.ini)
+        env:
+          SMOKE_API_TOKEN: ci-smoke-token-not-a-real-secret-0123456789
+        run: |
+          WORK=$(mktemp -d)
+          .venv/bin/python - "$WORK" <<'PY'
+          import configparser
+          import os
+          import pathlib
+          import sys
+
+          work = pathlib.Path(sys.argv[1])
+          cp = configparser.ConfigParser()
+          cp.read("config.example.ini", encoding="utf-8")
+
+          # 仅把运行时路径指向临时目录；安全默认保持示例值不变。
+          cp["runtime"]["db_path"] = str(work / "svc.db")
+          cp["runtime"]["log_root"] = str(work / "logs")
+          cp["runtime"]["artifact_root"] = str(work / "artifacts")
+          # 模型路径指向不存在的目录：任何 mkdir 都不应发生，/readyz 必须 503。
+          cp["runtime"]["model_path"] = str(work / "missing-model")
+
+          # 显式注入测试 token（不改示例配置的 require_token / 占位策略）。
+          token = os.environ["SMOKE_API_TOKEN"]
+          if cp.has_section("security"):
+              cp["security"]["api_token"] = token
+          else:
+              cp.add_section("security")
+              cp["security"]["api_token"] = token
+
+          with (work / "config.ini").open("w", encoding="utf-8") as fh:
+              cp.write(fh, space_around_delimiters=True)
+          PY
+          WHISPER_STT_CONFIG="$WORK/config.ini" SMOKE_MODEL_DIR="$WORK/missing-model" .venv/bin/python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from fastapi.testclient import TestClient
+
+          from whisper_stt_service.service.bootstrap import build_app
+
+          token = os.environ["SMOKE_API_TOKEN"]
+          app = build_app()
+          client = TestClient(app)
+
+          # 鉴权开启 + 错误 token 必须被拒。
+          assert client.get("/queue/summary", headers={"X-API-Token": "wrong"}).status_code == 401
+          # 正确 token 可访问业务接口。
+          assert client.get("/queue/summary", headers={"X-API-Token": token}).status_code == 200
+          # 进程存活 + DB 可查询。
+          assert client.get("/healthz", headers={"X-API-Token": token}).status_code == 200
+          # 模型缺失：/readyz 必须 503，且不得自动创建 model_path 伪装可用。
+          ready = client.get("/readyz", headers={"X-API-Token": token})
+          assert ready.status_code == 503, ready.status_code
+          model_dir = Path(os.environ["SMOKE_MODEL_DIR"])
+          assert not model_dir.exists(), f"model_path must not be created: {model_dir}"
+          print("service smoke ok")
+          PY

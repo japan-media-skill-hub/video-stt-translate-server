@@ -3,11 +3,78 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from faster_whisper import WhisperModel
+
+# 与 service 端一致：ASR 只吃 16k mono wav，缺失/0 字节即失败。
+MISSING_AUDIO_ARTIFACT_CODE = "missing_audio_artifact"
+
+
+class MissingAudioArtifactError(RuntimeError):
+    """ASR 输入 wav 缺失或为 0 字节（错误码 `missing_audio_artifact`）。"""
+
+    code = MISSING_AUDIO_ARTIFACT_CODE
+
+    def __init__(self, path: Path | str) -> None:
+        """记录缺失的音频产物路径，便于排障。"""
+
+        self.path = str(path)
+        super().__init__(f"{MISSING_AUDIO_ARTIFACT_CODE}: {self.path}")
+
+
+def atomic_write_text(path: Path, text: str) -> Path:
+    """原子写入文本：同目录临时文件 + flush + fsync + os.replace。
+
+    写入失败时删除临时文件并原样抛出，避免留下半截字幕。
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".tmp-{os.getpid()}-{uuid.uuid4().hex}.{path.name}")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def ensure_wav_artifact(wav_path: Path) -> Path:
+    """校验产物是存在且非空的 wav 文件；否则抛 MissingAudioArtifactError。
+
+    脚本模式同样遵守 "ASR 只吃 wav" 契约：即使调用方关闭预抽，
+    也只会把输入当作 wav 直接交给模型，绝不把 mp4 等视频交给 faster-whisper。
+    除大小检查外还校验 RIFF/WAVE 头，避免"文件存在但其实是视频"漏过契约。
+    """
+
+    if not wav_path.is_file():
+        raise MissingAudioArtifactError(wav_path)
+    try:
+        size = wav_path.stat().st_size
+    except OSError as exc:
+        raise MissingAudioArtifactError(wav_path) from exc
+    if size <= 0:
+        raise MissingAudioArtifactError(wav_path)
+    try:
+        with wav_path.open("rb") as handle:
+            header = handle.read(12)
+    except OSError as exc:
+        raise MissingAudioArtifactError(wav_path) from exc
+    # 合法 wav：前 4 字节 "RIFF"，第 8-12 字节 "WAVE"。
+    if len(header) < 12 or header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+        raise MissingAudioArtifactError(wav_path)
+    return wav_path
 
 
 def _parse_args() -> argparse.Namespace:
@@ -42,13 +109,18 @@ def _parse_args() -> argparse.Namespace:
         "--preextract-wav",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Extract input to 16k mono wav before transcription",
+        help=(
+            "Extract input to 16k mono wav before transcription (default: on). "
+            "ASR only ever consumes wav: with --no-preextract-wav the --input "
+            "must already be a non-empty wav file, otherwise the run fails with "
+            "missing_audio_artifact instead of feeding a video to the model."
+        ),
     )
     parser.add_argument(
         "--temp-audio",
         type=Path,
         default=None,
-        help="Temporary extracted wav path",
+        help="Extracted 16k mono wav path (also used as the wav input when pre-extraction is off)",
     )
     parser.add_argument(
         "--keep-temp-audio",
@@ -239,7 +311,6 @@ def main() -> int:
     device, compute_type = _resolve_runtime(args.device, args.compute_type)
 
     temp_audio = None
-    audio_input = input_path
     if args.preextract_wav:
         temp_audio = args.temp_audio
         if temp_audio is None:
@@ -248,6 +319,14 @@ def main() -> int:
             temp_audio = repo_root / temp_audio
         _extract_audio_with_progress(input_path, temp_audio, source_duration)
         audio_input = temp_audio
+    else:
+        # 关闭预抽时仍然只喂 wav：--temp-audio 指向已存在的 wav，否则用 --input。
+        # 绝不把原视频直接交给 faster-whisper（SPEC E：ASR 只吃 wav）。
+        audio_input = args.temp_audio or input_path
+        if not audio_input.is_absolute():
+            audio_input = repo_root / audio_input
+
+    ensure_wav_artifact(audio_input)
 
     print(f"input={input_path}", flush=True)
     print(f"audio_input={audio_input}", flush=True)
@@ -275,34 +354,39 @@ def main() -> int:
     count = 0
     last_emit = 0.0
     last_end = 0.0
-    with output_path.open("w", encoding="utf-8") as f:
-        for seg_no, seg in enumerate(segments, start=1):
-            text = seg.text.strip()
-            if not text:
-                continue
-            count += 1
-            last_end = float(seg.end)
-            f.write(f"{count}\n")
-            f.write(
-                f"{_format_timestamp(seg.start)} --> {_format_timestamp(seg.end)}\n"
-            )
-            f.write(f"{text}\n\n")
+    # 先累积到内存，循环结束后一次性原子替换输出文件：
+    # 中断时不会留下半截 ja.srt，也不会破坏已有产物。
+    srt_parts: list[str] = []
+    for seg_no, seg in enumerate(segments, start=1):
+        text = seg.text.strip()
+        if not text:
+            continue
+        count += 1
+        last_end = float(seg.end)
+        srt_parts.append(f"{count}\n")
+        srt_parts.append(
+            f"{_format_timestamp(seg.start)} --> {_format_timestamp(seg.end)}\n"
+        )
+        srt_parts.append(f"{text}\n\n")
 
-            now = time.perf_counter()
-            should_emit = (
-                seg_no % max(args.progress_every, 1) == 0 or now - last_emit >= 2.0
-            )
-            if should_emit:
-                elapsed = now - transcribe_started
-                if transcribe_duration and transcribe_duration > 0:
-                    progress = min(last_end / transcribe_duration, 1.0)
-                    speed = last_end / max(elapsed, 1e-6)
-                    eta = (transcribe_duration - last_end) / max(speed, 1e-6)
-                else:
-                    progress = 0.0
-                    eta = None
-                _print_progress("TRANSCRIBE", progress, elapsed, eta)
-                last_emit = now
+        now = time.perf_counter()
+        should_emit = (
+            seg_no % max(args.progress_every, 1) == 0 or now - last_emit >= 2.0
+        )
+        if should_emit:
+            elapsed = now - transcribe_started
+            if transcribe_duration and transcribe_duration > 0:
+                progress = min(last_end / transcribe_duration, 1.0)
+                speed = last_end / max(elapsed, 1e-6)
+                eta = (transcribe_duration - last_end) / max(speed, 1e-6)
+            else:
+                progress = 0.0
+                eta = None
+            _print_progress("TRANSCRIBE", progress, elapsed, eta)
+            last_emit = now
+
+    # 循环结束再原子落盘：中途中断不会留下半截字幕。
+    atomic_write_text(output_path, "".join(srt_parts))
 
     elapsed = time.perf_counter() - transcribe_started
     _print_progress("TRANSCRIBE", 1.0, elapsed, 0.0)

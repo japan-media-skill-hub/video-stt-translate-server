@@ -1,6 +1,6 @@
 [project]
 name = "video-stt-translate-server"
-version = "0.4.0"
+version = "0.5.0"
 description = "Whisper STT + translation service for queued video processing"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,11 +14,19 @@ dependencies = [
     "pydantic>=2.7.0",
     "requests>=2.31.0",
     "uvicorn>=0.29.0",
+    # 可观测性：/metrics 输出 Prometheus 文本格式（批次 5）。
+    "prometheus-client>=0.20.0",
 ]
 
 [dependency-groups]
+# 纯 CPU 开发依赖：CI 使用 `uv sync --group dev`（不装 gpu group），
+# 覆盖单元测试与 fake executor 集成测试所需库，不依赖 ffmpeg/模型/网络。
 dev = [
     "pytest>=8.2.0",
+    "ruff>=0.6.0",
+    "prometheus-client>=0.20.0",
+    # FastAPI TestClient 依赖 httpx；显式声明，避免"本机恰好装了 httpx"掩盖干净环境的缺失。
+    "httpx>=0.27.0",
 ]
 gpu = [
     "torch==2.8.0+cu128",
@@ -51,3 +59,20 @@ explicit = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# 默认跳过 manual（真实模型 / 真实 LLM，需 WHISPER_STT_REAL_MEDIA=1）与 e2e（需起服务 + 真实媒体）。
+# 注意：显式选中 manual 目录（如 `pytest tests/manual -m manual`）时该过滤不生效，
+# 是否执行由模块内 skipif 依据 WHISPER_STT_REAL_MEDIA 决定。
+addopts = ["-m", "not manual and not e2e", "--strict-markers"]
+markers = [
+    "manual: 需要真实媒体、本地模型权重或在线 LLM 接口（用 WHISPER_STT_REAL_MEDIA=1 显式开启）",
+    "e2e: 需要拉起服务并跑真实媒体的端到端驱动（默认跳过）",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# 基线规则：语法错误（E9）+ pyflakes（F），仅用于本地排查；
+# CI 只用 `--select E9` 做语法门禁（存量代码仍有 F 类告警，见 README「已知问题」）。
+select = ["E9", "F"]

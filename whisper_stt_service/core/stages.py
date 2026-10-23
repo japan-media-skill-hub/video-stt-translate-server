@@ -45,11 +45,23 @@ STAGE_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
         "vad_offset",
         "local_files_only",
     ),
+    # translate：SPEC C.2 要求 [translation] 的全部可覆盖参数都能按 job 覆盖；
+    # timeout_sec/max_retries 是本服务历史通用的任务超时/重试键，与 new 键并存且约定不变。
     "translate": (
         "timeout_sec",
         "max_retries",
-        "chunk_minutes",
+        "parallel",
+        "batch_size",
+        "timeout",
+        "disable_proxy",
+        "request_interval",
         "retry",
+        "chunk_minutes",
         "copy_back",
+        "max_chars",
+        "checkpoint_enabled",
+        # 检查点（.progress.json）在任务成功后的保留秒数，0 表示立即清理。
+        "progress_ttl_sec",
+        "strict_ids",
     ),
 }

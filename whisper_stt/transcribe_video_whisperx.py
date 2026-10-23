@@ -3,10 +3,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
-from whisper_stt_service.executor.stt_whisperx import run_stt_whisperx
+# 脚本可从任意 cwd 启动（worktree / 主仓库 / CI）：显式把仓库根与脚本目录注入
+# sys.path，既保证 whisper_stt_service 可导入，也保证能复用同目录的 wav 契约实现。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
+for _path in (str(_REPO_ROOT), str(_SCRIPT_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from whisper_stt_service.executor.stt_whisperx import run_stt_whisperx  # noqa: E402
+
+# 与 transcribe_video.py 复用同一份 wav 契约实现（脚本模式两条路径行为一致）。
+from transcribe_video import (  # noqa: E402
+    _extract_audio_with_progress,
+    _probe_duration,
+    ensure_wav_artifact,
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -68,6 +84,23 @@ def _parse_args() -> argparse.Namespace:
         default=7200,
         help="Execution timeout in seconds",
     )
+    parser.add_argument(
+        "--preextract-wav",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Extract input to 16k mono wav before transcription (default: on). "
+            "ASR only ever consumes wav: with --no-preextract-wav the --input "
+            "must already be a non-empty wav file, otherwise the run fails with "
+            "missing_audio_artifact instead of feeding a video to the model."
+        ),
+    )
+    parser.add_argument(
+        "--temp-audio",
+        type=Path,
+        default=None,
+        help="Extracted 16k mono wav path (also used as the wav input when pre-extraction is off)",
+    )
     return parser.parse_args()
 
 
@@ -97,27 +130,56 @@ def main() -> int:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # SPEC E（D1）：ASR 只吃 16k mono wav。脚本模式在这里强制预抽或校验 wav，
+    # 绝不把原视频直接交给 run_stt_whisperx。
+    temp_audio: Path | None = None
+    if args.preextract_wav:
+        temp_audio = args.temp_audio
+        if temp_audio is None:
+            temp_audio = output_path.with_suffix(".tmp.16k.wav")
+        if not temp_audio.is_absolute():
+            temp_audio = repo_root / temp_audio
+        _extract_audio_with_progress(input_path, temp_audio, _probe_duration(input_path))
+        audio_input = temp_audio
+    else:
+        # 关闭预抽时仍然只喂 wav：--temp-audio 指向已存在的 wav，否则用 --input。
+        audio_input = args.temp_audio or input_path
+        if not audio_input.is_absolute():
+            audio_input = repo_root / audio_input
+
+    ensure_wav_artifact(audio_input)
+
     started = time.perf_counter()
-    effective = run_stt_whisperx(
-        input_video=input_path,
-        output_ja_srt=output_path,
-        language=args.language,
-        timeout_sec=max(args.timeout_sec, 1),
-        model=model_ref,
-        device=args.device,
-        compute_type=args.compute_type,
-        batch_size=max(args.batch_size, 1),
-        vad_config_path=str(vad_cfg),
-        align_model_root=str(align_root),
-        align_enabled=bool(args.align_enabled),
-        vad_backend=args.vad_backend,
-        vad_onset=args.vad_onset,
-        vad_offset=args.vad_offset,
-        local_files_only=bool(args.local_files_only),
-    )
+    try:
+        effective = run_stt_whisperx(
+            input_video=audio_input,
+            output_ja_srt=output_path,
+            language=args.language,
+            timeout_sec=max(args.timeout_sec, 1),
+            model=model_ref,
+            device=args.device,
+            compute_type=args.compute_type,
+            batch_size=max(args.batch_size, 1),
+            vad_config_path=str(vad_cfg),
+            align_model_root=str(align_root),
+            align_enabled=bool(args.align_enabled),
+            vad_backend=args.vad_backend,
+            vad_onset=args.vad_onset,
+            vad_offset=args.vad_offset,
+            local_files_only=bool(args.local_files_only),
+        )
+    finally:
+        # 预抽出来的临时 wav 默认用完即删；--temp-audio 由调用方提供的路径不动。
+        if (
+            temp_audio is not None
+            and args.temp_audio is None
+            and temp_audio.exists()
+        ):
+            temp_audio.unlink()
     elapsed = time.perf_counter() - started
 
     print(f"input={input_path}", flush=True)
+    print(f"audio_input={audio_input}", flush=True)
     print(f"output={output_path}", flush=True)
     print(f"elapsed_sec={elapsed:.2f}", flush=True)
     print(f"effective_config={json.dumps(effective, ensure_ascii=False)}", flush=True)

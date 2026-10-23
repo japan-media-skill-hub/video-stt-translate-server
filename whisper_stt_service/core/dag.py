@@ -6,6 +6,15 @@ from collections import deque
 
 from whisper_stt_service.core.stages import STAGE_CONFIG_KEYS, SUPPORTED_STAGES
 
+# 本服务唯一支持的 DAG 版本；缺省视为 1（历史请求不带 version）。
+SUPPORTED_DAG_VERSION = 1
+
+# 互斥的 ASR 阶段：DAG 中必须恰好出现一个（SPEC B.2-2、D1 的 wav 契约）。
+ASR_STAGES: tuple[str, ...] = ("stt", "stt_whisperx")
+
+# ASR 的硬前置阶段：ASR 必须消费 extract 产出的 16k mono wav（SPEC B.2-3、E）。
+REQUIRED_ASR_UPSTREAM_STAGE = "extract"
+
 
 def build_default_dag() -> dict:
     """返回与历史行为兼容的默认三阶段 DAG。"""
@@ -21,9 +30,13 @@ def build_default_dag() -> dict:
 
 
 def normalize_and_validate_dag(raw: dict | None) -> dict:
-    """归一化并校验 DAG。"""
+    """归一化并校验 DAG。
+
+    包含结构校验与 SPEC B.2 语义校验（版本、唯一 ASR、extract 依赖、translate 依赖 ASR）。
+    """
 
     src = build_default_dag() if raw is None else raw
+    _validate_dag_version(src)
     stages = src.get("stages") if isinstance(src, dict) else None
     if not isinstance(stages, list) or len(stages) == 0:
         raise ValueError("dag_empty")
@@ -57,7 +70,64 @@ def normalize_and_validate_dag(raw: dict | None) -> dict:
                 raise ValueError("dag_dependency_missing")
 
     _ensure_no_cycle(normalized_stages)
-    return {"version": 1, "stages": normalized_stages}
+    _validate_dag_semantics(normalized_stages)
+    return {"version": SUPPORTED_DAG_VERSION, "stages": normalized_stages}
+
+
+def _validate_dag_version(src: object) -> None:
+    """校验 DAG 版本：只接受整数 1。
+
+    “缺省”仅指请求里完全没有 `version` 键（历史客户端不带该字段），此时按 1 处理；
+    显式传 `null`/None 不算缺省，必须拒绝——否则调用方可以用 null 绕过版本契约。
+    其他类型（bool/float/str/list/dict）一律 `dag_version_not_supported`。
+    """
+
+    if not isinstance(src, dict):
+        return
+    if "version" not in src:
+        return
+    raw_version = src["version"]
+    if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+        raise ValueError("dag_version_not_supported")
+    if raw_version != SUPPORTED_DAG_VERSION:
+        raise ValueError("dag_version_not_supported")
+
+
+def _validate_dag_semantics(stages: list[dict[str, object]]) -> None:
+    """校验 DAG 语义：恰好一个 ASR、ASR 依赖闭包含 extract、translate 依赖闭包含 ASR。"""
+
+    dependencies = {
+        str(item["stage"]): [str(dep) for dep in item["depends_on"]] for item in stages
+    }
+    present_asr = [name for name in ASR_STAGES if name in dependencies]
+    if len(present_asr) > 1:
+        raise ValueError("dag_asr_stage_conflict")
+    if len(present_asr) == 0:
+        raise ValueError("dag_missing_asr_stage")
+
+    asr_stage = present_asr[0]
+    asr_closure = _dependency_closure(asr_stage, dependencies)
+    if REQUIRED_ASR_UPSTREAM_STAGE not in asr_closure:
+        raise ValueError("dag_missing_extract_dependency")
+
+    if "translate" in dependencies:
+        translate_closure = _dependency_closure("translate", dependencies)
+        if asr_stage not in translate_closure:
+            raise ValueError("dag_translate_without_asr")
+
+
+def _dependency_closure(stage: str, dependencies: dict[str, list[str]]) -> set[str]:
+    """返回指定阶段依赖闭包（不含自身），`dependencies` 必须已通过结构校验。"""
+
+    closure: set[str] = set()
+    pending = list(dependencies.get(stage, []))
+    while pending:
+        cur = pending.pop()
+        if cur in closure or cur == stage:
+            continue
+        closure.add(cur)
+        pending.extend(dependencies.get(cur, []))
+    return closure
 
 
 def normalize_and_validate_job_config(job_config: dict | None, dag: dict) -> dict:
@@ -109,12 +179,22 @@ def _validate_stage_config_value(stage: str, key: str, value: object) -> None:
         ("translate", "max_retries"): 0,
         ("translate", "chunk_minutes"): 1,
         ("translate", "retry"): 1,
+        # SPEC C.1/C.3：并发上限、单批条目数与字符上限都必须为正整数。
+        ("translate", "parallel"): 1,
+        ("translate", "batch_size"): 1,
+        ("translate", "max_chars"): 1,
+        # 上游 HTTP 超时秒数，必须为正整数。
+        ("translate", "timeout"): 1,
+        # SPEC C.4：检查点保留秒数，允许 0（成功即清理）。
+        ("translate", "progress_ttl_sec"): 0,
     }
     float_min_rules: dict[tuple[str, str], float] = {
         ("stt", "patience"): 0.1,
         ("stt", "vad_max_speech_duration_s"): 1.0,
         ("stt", "compression_ratio_threshold"): 0.1,
         ("stt", "hallucination_silence_threshold"): 0.0,
+        # SPEC D2：批次派发间隔（秒），0 表示关闭节流。
+        ("translate", "request_interval"): 0.0,
     }
     float_range_rules: dict[tuple[str, str], tuple[float, float]] = {
         ("stt", "vad_threshold"): (0.01, 0.99),
@@ -127,6 +207,10 @@ def _validate_stage_config_value(stage: str, key: str, value: object) -> None:
         ("stt", "vad_filter"),
         ("stt_whisperx", "align_enabled"),
         ("stt_whisperx", "local_files_only"),
+        # SPEC C.2/C.4/C.5：布尔开关不接受 int/str，避免 "false" 被当成 true。
+        ("translate", "disable_proxy"),
+        ("translate", "checkpoint_enabled"),
+        ("translate", "strict_ids"),
     }
     str_rules = {
         ("stt", "device"),
