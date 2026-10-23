@@ -8,14 +8,16 @@ A local movie translation pipeline that combines `ffmpeg`, `Whisper/WhisperX`, a
 > Remote CI history: run [39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
 > (`bba96a0`) failed at the committed-lock check because the lock referenced a host-only TUNA mirror; run
 > [39995654486](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39995654486)
-> (`66678d0`) passed the lock check but hit two clean-runner test issues. Then **three consecutive green commits**:
+> (`66678d0`) passed the lock check but hit two clean-runner test issues. Then **four consecutive green commits**:
 > `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310),
 > `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133),
 > and `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)
-> (also 39997946922 / 39997927908, triggered by the feature/main/tag push, are successes for the same commit).
+> (also 39997946922 / 39997927908, triggered by the feature/main/tag push, are successes for the same commit),
+> and `da43057` → [40000383321](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/40000383321),
+> which makes the restart-recovery integration case deterministic after it flaked once on a `main` push of `fd383c9`.
 > The seven P1s have been implemented and independently re-verified by Sol with the original real-SQLite/file
 > counterexamples and the cross-FS copyback/symlink-swap tests. The annotated `v0.5.0` tag is pushed and points
-> to this final documentation commit; the release parent re-points it after the final docs commit. Real
+> to the final documentation commit on `main` (`git describe --tags --exact-match main`). Real
 > 2-hour/GPU acceptance and provider-side token rotation remain unverified. See [Verification status](#verification-status).
 
 ## Project purpose
@@ -304,7 +306,7 @@ WHISPER_STT_REAL_MEDIA=1 \
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push / pull request. **Three consecutive release commits are green**:
+`.github/workflows/ci.yml` runs on every push / pull request. **Four consecutive release commits are green**:
 
 - run [39981535390](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39981535390)
   (`bba96a0`): failed at `uv lock --check` because the lock referenced a host-only TUNA mirror;
@@ -319,10 +321,17 @@ WHISPER_STT_REAL_MEDIA=1 \
 - runs [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791),
   [39997946922](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997946922)
   and [39997927908](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997927908)
-  (`c88cc80`): all **success** (feature/main/tag push triggers), the third consecutive green commit.
+  (`c88cc80`): all **success** (feature/main/tag push triggers), the third consecutive green commit;
+- run [39999279981](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39999279981)
+  (`fd383c9`, `main`): failed once because `test_restart_recovery_counts_attempt` released the hung worker
+  before the restarted runtime recovered, so `recovered` was legitimately `0`; the same commit also passed in
+  run 39998978213/39999284932. The test now waits until the old executor is inside the controlled hang and
+  performs recovery first, and no product code changed;
+- run [40000383321](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/40000383321)
+  (`da43057`): **success**, the deterministic-test fix and the fourth consecutive green commit.
 
 Green sequence: `2623545` → 39996457310; `5e67c7b` → 39997343133; `c88cc80` → 39997953791
-(plus 39997946922/39997927908). Local checks below complement, not replace, these runs.
+(plus 39997946922/39997927908); `da43057` → 40000383321. Local checks below complement, not replace, these runs.
 
 - `secret-scan`: `.github/scripts/secret_scan.sh` fails if a tracked file contains a real
   `sk-…` / `hf_…` / `ghp_…` / `AIza…` token or a key file such as `hf-token.md` is committed.
@@ -352,7 +361,7 @@ with **zero** `nvidia-*` packages.
 - [x] `v0.3.0`: WhisperX stage, explicit DAG E2E, deterministic E2E exits, interrupted-run recovery
 - [x] `v0.4.0`: global API token auth, graceful drain shutdown, round-based shutdown E2E, and hourly artifact cleanup scheduler
 - [x] `v0.5.0`: reliability & translation hardening — task lifecycle closure (lease heartbeat/reaper/fencing/cascade/bounded drain), enqueue-time DAG semantics, wav contract for ASR, retry/cancel APIs, translation concurrency cap 2 with per-batch checkpoint resume, atomic artifact writes, model cache + parallelism limits, security fail-closed defaults with path allow-lists, structured logging + health/readiness/metrics, CI + lockfile + secret hygiene
-  - Tag/release evidence is tracked in [Verification status](#verification-status): consecutive green commits `2623545` → 39996457310, `5e67c7b` → 39997343133 and `c88cc80` → 39997953791; the annotated `v0.5.0` tag is pushed and points to this final documentation commit (parent re-points after the final docs commit).
+  - Tag/release evidence is tracked in [Verification status](#verification-status): consecutive green commits `2623545` → 39996457310, `5e67c7b` → 39997343133, `c88cc80` → 39997953791 and `da43057` → 40000383321 (restart-recovery test determinism); the annotated `v0.5.0` tag is pushed and points to the final documentation commit on `main`.
 
 ### Delta since v0.4.0
 
@@ -376,7 +385,7 @@ with **zero** `nvidia-*` packages.
 - **Resources**: in-process model cache + semaphore (`model_cache_size`, `model_parallelism`)
 - **Security**: `require_token`, `allow_placeholder_token`, `docs_enabled`, `allowed_video_roots`, `allowed_copy_back_roots`, `bind_host/bind_port`; constant-time token comparison
 - **Observability**: `/healthz`, `/readyz`, `/metrics`, request-id logging, 5-minute queue throughput
-- **Delivery**: CI workflow added; three consecutive green commits (`2623545` → 39996457310, `5e67c7b` → 39997343133, `c88cc80` → 39997953791; c88cc80 also green in 39997946922/39997927908). Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. `main` is FFed through the release documentation commits (currently `f495fe0`); the parent FFs this final docs update; annotated `v0.5.0` tag is pushed and points to this final documentation commit (parent re-points after the final docs commit)
+- **Delivery**: CI workflow added; four consecutive green commits (`2623545` → 39996457310, `5e67c7b` → 39997343133, `c88cc80` → 39997953791 plus 39997946922/39997927908, `da43057` → 40000383321). Tracked `uv.lock` (public PyPI default, explicit cu128 for torch), real-media tests moved to `tests/manual`, `docs/hf-token.md` removed, empty `.venv` removed. `main` is FFed through the release commits and the annotated `v0.5.0` tag points to the final documentation commit on `main`
 
 ### Planned
 
@@ -403,18 +412,18 @@ installed. No paid LLM request was sent during this verification pass.
 | Bootstrap smoke (explicit token + missing model) | passed locally | wrong token 401; queue/health 200; `/readyz` 503; model dir not created |
 | Full pytest suite | passed locally | 532 passed, 5 deselected in 41.13s (2026-10-24, fresh basetemp) |
 | Seven P1s (copyback sink, checkpoint identity, finally compare-and-remove, stop/drain tuple-fenced rollback, promotion-error convergence, atomic fenced single-write, worker boot nonce ABA) | **implemented + independently re-verified** | original real-SQLite/file counterexamples re-run; cross-FS `run_translate` fake-HTTP copyback and symlink-swap during copy both pass |
-| Remote CI | **three consecutive green commits** | failures: run 39981535390 @ `bba96a0` (host-only TUNA lock) and run 39995654486 @ `66678d0` (service.log creation order, script-mode wav check before ffprobe). Green: `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310); `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133); `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791), plus 39997946922/39997927908 also success |
+| Remote CI | **four consecutive green commits** | failures: run 39981535390 @ `bba96a0` (host-only TUNA lock) and run 39995654486 @ `66678d0` (service.log creation order, script-mode wav check before ffprobe). Green: `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310); `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133); `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791) (plus 39997946922/39997927908); `da43057` → [40000383321](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/40000383321). One `main` push of `fd383c9` failed on a non-deterministic restart-recovery test (run 39999279981); the same commit passed in 39998978213/39999284932 and the test is now deterministic |
 | Real 2-hour E2E | **not verified** | 4 configured `/srv/media/...` paths missing; `/srv/media/jellyfin` empty; only 30s/180s samples |
 | GPU memory peak | **not verified** | `nvidia-smi` exit 255, `NVML GPU access blocked by OS` |
 | Provider-side token rotation | **not done / no evidence** | operator action; local deletion/ignore is not revocation |
-| v0.5.0 tag/release | **pushed; points to final docs commit** | annotated `v0.5.0` tag points to this final documentation commit; release parent re-points it after the final docs commit |
+| v0.5.0 tag/release | **pushed** | annotated `v0.5.0` tag points to the final documentation commit on `main` (`git describe --tags --exact-match main`) |
 
 ## Known issues
 
 - The ruff baseline (`E9` + `F`) still reports findings on pre-existing modules; CI only enforces a syntax gate.
 - `pyproject.toml` keeps `prometheus-client` in the main dependencies for `/metrics`; if the package is missing at runtime, `/metrics` must degrade gracefully instead of breaking the app.
 - **v0.5.0 tag alignment**: the annotated tag is pushed and points to this final documentation commit; the
-  parent re-points it after the final docs commit. The historical `v0.4.0` tag was also backfilled at `b029d07`.
+  commit on `main`. The historical `v0.4.0` tag was also backfilled at `b029d07`.
 - End-to-end acceptance on a real 2-hour sample (wall-clock per stage, request counts, GPU memory peaks,
   `kill -9` resume) is **not yet verified**. Re-checked 2026-10-23: the four paths in
   `tests/e2e/video_paths.txt` under `/srv/media/jellyfin/...` are all missing, `/srv/media/jellyfin` is empty,
