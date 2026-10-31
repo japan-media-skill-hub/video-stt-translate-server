@@ -114,43 +114,19 @@ def _build_translate_messages(batch: list[SrtEntry]) -> list[dict[str, str]]:
 
 
 def extract_json_object(text: str) -> Any:
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if (
-            len(lines) >= 3
-            and lines[0].startswith("```")
-            and lines[-1].startswith("```")
-        ):
-            text = "\n".join(lines[1:-1]).strip()
-    if "```" in text:
-        chunks = text.split("```")
-        for chunk in chunks:
-            chunk = chunk.strip()
-            if chunk.startswith("json"):
-                chunk = chunk[4:].strip()
-            if chunk.startswith("[") or chunk.startswith("{"):
-                try:
-                    return json.loads(chunk)
-                except json.JSONDecodeError:
-                    pass
-    if text.startswith("json"):
-        text = text[4:].strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
+    """从模型返回文本中提取 JSON 值。
 
-    arr_start = text.find("[")
-    arr_end = text.rfind("]")
-    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
-        return json.loads(text[arr_start : arr_end + 1])
+    P2 修复：本函数原先自带一份"从首个 `[`/`{` 截到最后一个 `]`/`}` 再整体
+    loads"的实现，与 service 侧同样的缺陷——上游在 JSON 后附带说明文字（说明里
+    带括号）或直接拼接第二个 JSON 值时必抛 Extra data，整批重试全部 parse 失败。
+    现统一委托给 `whisper_stt_service.executor.common._extract_json_object()`：
+    同一语义只有一处实现，脚本模式与服务模式不会再各自漂移。
+    延迟导入：脚本仍可独立放置，只有真正解析响应时才依赖仓库内的 service 包。
+    """
 
-    obj_start = text.find("{")
-    obj_end = text.rfind("}")
-    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
-        return json.loads(text[obj_start : obj_end + 1])
-    raise RuntimeError("unable to parse JSON response")
+    from whisper_stt_service.executor.common import _extract_json_object
+
+    return _extract_json_object(text, required_keys=("id", "text_zh"))
 
 
 def _format_hms(seconds: float) -> str:

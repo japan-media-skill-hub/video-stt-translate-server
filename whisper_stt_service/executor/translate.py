@@ -196,7 +196,11 @@ def _call_translate_api(
     )
     response.raise_for_status()
     content = response.json()["choices"][0]["message"]["content"]
-    parsed = _extract_json_object(content)
+    # P2：上游常在 JSON 后附带说明文字、或把两个 JSON 值直接拼接；解析层只取
+    # 第一个可用 JSON 值并忽略尾部（合并会把模型附带的格式示例当成译文）。
+    # 首个值若缺 id，下面的 id 校验照旧抛 `TranslatePartialIdsError`（含 partial），
+    # 由调用方 C.5"接受子集 + 只补缺失 + 保留原文"兜底，语义不变。
+    parsed = _extract_json_object(content, required_keys=("id", "text_zh"))
     if not isinstance(parsed, list):
         raise ValueError("model output is not a JSON array")
 

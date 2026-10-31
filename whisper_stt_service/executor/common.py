@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Full, Queue
-from typing import Any
+from typing import Any, Iterator
 
 from whisper_stt_service.executor.atomic import atomic_write_text
 
@@ -426,8 +426,103 @@ def _dump_srt(
     atomic_write_text(out_path, "".join(parts))
 
 
-def _extract_json_object(text: str) -> Any:
-    """从模型返回文本中提取 JSON 对象/数组。"""
+class JsonExtractionError(ValueError):
+    """上游响应里确实不存在任何可用的 JSON 值（parse 类错误，可重试）。
+
+    继承 `ValueError` 是为了与 `json.loads` 抛出的 `JSONDecodeError` 保持同一
+    语义：`translate._error_class()` 会把它归为 `parse`，
+    `translate._is_retryable()` 判定为可重试——不再因为"文本里连一个括号都没有"
+    就退化成不可重试错误、当场放弃任务（旧实现正是如此）。
+    """
+
+
+# 顶层 JSON 值的结构化解码器：`raw_decode(s, idx)` 从 idx 处解码**一个** JSON 值并
+# 返回 (值, 结束偏移)，因此可以只吃下第一个 JSON 值、完全忽略其后的多余内容。
+_JSON_DECODER = json.JSONDecoder()
+
+# 候选起点尝试上限：畸形输出（例如成千上万个未闭合的 `{`）会让"逐个 `{`/`[` 试
+# 解码"退化成 O(n²)；正常响应里的候选起点只有个位数，256 足够兜住真实文本。
+_MAX_JSON_CANDIDATE_ATTEMPTS = 256
+
+
+def _iter_json_values(payload: str) -> Iterator[tuple[int, Any]]:
+    """按出现顺序产出 payload 中的顶层 JSON 值及其起始偏移。
+
+    只在 `{` / `[` 处尝试解码：
+    - 解码成功即跳到该值末尾继续扫描（内层对象不会被当成独立值）；
+    - 解码失败（例如正文里恰好出现 `{`）则前进一个字符再试。
+    这样正文里的普通数字/汉字/单词不会被误判成 JSON 值。
+    """
+
+    index = 0
+    attempts = 0
+    length = len(payload)
+    while index < length and attempts < _MAX_JSON_CANDIDATE_ATTEMPTS:
+        if payload[index] not in "{[":
+            index += 1
+            continue
+        attempts += 1
+        try:
+            value, end = _JSON_DECODER.raw_decode(payload, index)
+        except ValueError:
+            # JSONDecodeError 是 ValueError 的子类：该起点不是合法 JSON，继续往后找。
+            index += 1
+            continue
+        yield index, value
+        index = end
+
+
+def _looks_like_expected_payload(
+    value: Any, required_keys: tuple[str, ...] | None
+) -> bool:
+    """判断某个 JSON 值是否"像想要的载荷"（决定是否跳过它继续看下一个值）。
+
+    未指定 `required_keys` 时只排除 None/空容器；指定后要求对象本身、或数组里
+    至少一个元素命中其中一个字段名——用于跨过上游偶尔先吐出来的空对象/元数据
+    对象（例如先 `{"note": "ok"}` 再给真正的数组）。
+    """
+
+    if required_keys is None:
+        if isinstance(value, (dict, list)):
+            return bool(value)
+        return True
+    if isinstance(value, dict):
+        return any(key in value for key in required_keys)
+    if isinstance(value, list):
+        return any(
+            isinstance(item, dict) and any(key in item for key in required_keys)
+            for item in value
+        )
+    return False
+
+
+def _extract_json_object(
+    text: str, *, required_keys: tuple[str, ...] | None = None
+) -> Any:
+    """从模型返回文本中提取 JSON 对象/数组。
+
+    P2 修复（线上真实反例）：上游返回"JSON 值 + 尾部多余内容"——两个 JSON 值
+    直接拼接，或 JSON 后跟说明文字（说明里还带括号）——旧实现"从首个 `[`/`{`
+    截到最后一个 `]`/`}` 再整体 loads"会把尾部一起塞进 `json.loads()`，于是
+    稳定抛 `Extra data: line 1 column 31 (char 30)`，同一批次重试全部 parse
+    失败、整个任务失败。
+
+    现在的取值顺序：
+    1. 先按原样整段解析（保留代码围栏 / `json` 前缀的旧处理），命中即返回；
+    2. 否则用 `json.JSONDecoder().raw_decode()` 从每一处 `{` / `[` 起始解码，
+       返回**第一个可用**的 JSON 值并忽略其后的全部内容；
+    3. `required_keys` 用来判定"首个值是否可用"（缺字段/为空 = 不可用，例如
+       上游先吐出来的元数据对象）：此时才继续看后面出现的下一个 JSON 值；
+    4. 没有任何候选满足 `required_keys` 时退回第一个解码出的值——解析层不替
+       上层判定业务形状（数组/对象由调用方自己校验），不把可救的响应判死；
+    5. 一个 JSON 值都解不出来时才抛 `JsonExtractionError`（可重试的 parse
+       错误），绝不静默返回空结果，也绝不丢批次。
+
+    "取首个、忽略尾部"是刻意选择：模型有时会在答案后面附格式示例
+    （如 `[{"id": 1, "text_zh": "..."}]`），合并会把示例当成译文写进字幕。
+    首个值缺 id 时不会丢整批：调用方 C.5 会先接受已返回的子集、只补缺失 id，
+    最后仍缺的照旧保留日文原文，绝不丢字幕行。
+    """
 
     payload = text.strip()
     if payload.startswith("```") and payload.endswith("```"):
@@ -440,15 +535,16 @@ def _extract_json_object(text: str) -> Any:
         return json.loads(payload)
     except json.JSONDecodeError:
         pass
-    arr_start = payload.find("[")
-    arr_end = payload.rfind("]")
-    if arr_start != -1 and arr_end > arr_start:
-        return json.loads(payload[arr_start : arr_end + 1])
-    obj_start = payload.find("{")
-    obj_end = payload.rfind("}")
-    if obj_start != -1 and obj_end > obj_start:
-        return json.loads(payload[obj_start : obj_end + 1])
-    raise RuntimeError("unable to parse JSON response")
+
+    candidates = list(_iter_json_values(payload))
+    if not candidates:
+        # 明确失败（可重试的 parse 类错误）：绝不返回空结果让上层当成"翻译完了"。
+        raise JsonExtractionError("unable to extract JSON value from response")
+    for _offset, value in candidates:
+        if _looks_like_expected_payload(value, required_keys):
+            return value
+    # 形状都不符合预期：退回首个值，交由上层按既有契约判定（不在这里吞掉）。
+    return candidates[0][1]
 
 
 def _load_llm_config(config_path: Path) -> configparser.ConfigParser:

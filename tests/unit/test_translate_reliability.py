@@ -23,15 +23,19 @@ from whisper_stt_service.executor.atomic import (
 )
 from whisper_stt_service.executor.common import (
     ExecutorCancelledError,
+    JsonExtractionError,
     MissingAudioArtifactError,
     SrtEntry,
     _dump_srt,
+    _extract_json_object,
     build_translate_batches,
     resolve_translate_settings,
 )
 from whisper_stt_service.executor.translate import (
     TranslateCancelledError,
     _build_idempotency_key,
+    _error_class,
+    _is_retryable,
     _load_checkpoint,
     _load_llm_profiles,
     _pick_llm_profile,
@@ -1707,3 +1711,253 @@ def test_fenced_checkpoint_cannot_overwrite_new_owner_after_publish_commit(
     # 关键断言走真实文件内容（而非 mock 调用次数）：NEW 不得被 w1 helper 覆盖。
     assert canonical.read_text(encoding="utf-8") == new_owner_payload
     assert not output.exists()
+
+
+# -------------------------------- P2 回归：上游 JSON 后带多余内容（真实反例）
+#
+# 线上真实失败：任务级 last_error =
+#   translate batch failed: 0/0: Extra data: line 1 column 31 (char 30)
+# 即上游 content 是"JSON 值 + 尾部多余内容"（多个 JSON 值拼接 / JSON 后跟说明
+# 文字），旧 `_extract_json_object()` 的做法是"从首个 `[`/` {` 截到最后一个
+# `]`/`}` 再整体 loads"，尾部内容一起被塞进 json.loads()，于是同一批次 8 次
+# 重试全部 parse 失败、整个任务失败。
+#
+# 下面这些用例按真实反例构造：直接喂真实的 `_extract_json_object()` 与真实的
+# `_call_translate_api()`（只注入 post_func 提供 HTTP 响应体，不 mock 解析
+# 与 id 校验逻辑），确保覆盖的是生产代码路径。
+
+
+def _content_http(content: str) -> FakeResponse:
+    """构造携带任意 content 字符串的 200 响应（与真实响应体同一形状）。"""
+
+    return FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+
+
+def test_extract_json_object_takes_first_value_from_concatenated_values() -> None:
+    """反例 a：两个 JSON 值直接拼接 -> 取首个值，忽略尾部（旧实现抛 Extra data）。
+
+    策略明确为"取首个可用 JSON 值、忽略尾部"：解析层**不做合并**。模型常在
+    答案后面附格式示例（如 `[{"id": 1, "text_zh": "..."}]`），合并会把示例
+    当成译文写进字幕；真正缺失的 id 由调用方 C.5（接受子集 + 只补缺失 +
+    保留原文）兜底，因此取首个既不会丢整批，也不会串批。
+    """
+
+    assert _extract_json_object('{"1": "a"}{"2": "b"}') == {"1": "a"}
+    assert _extract_json_object(
+        '[{"id": 1, "text_zh": "a"}][{"id": 2, "text_zh": "b"}]'
+    ) == [{"id": 1, "text_zh": "a"}]
+
+
+def test_extract_json_object_ignores_trailing_prose() -> None:
+    """反例 b：JSON 值 + 尾部说明文字 -> 取出 JSON，忽略说明（旧实现抛 Extra data）。
+
+    说明文字里带方括号/花括号时旧实现必坏：它用 `rfind("]")` 取最后一个 `]`，
+    截出来的片段把尾部也包进来，于是整体 loads 抛 Extra data（线上
+    `line 1 column 31 (char 30)` 即此形状：首个 JSON 值很短、尾巴里还有括号）。
+    """
+
+    assert _extract_json_object('{"1": "a"} 以上是翻译') == {"1": "a"}
+    assert _extract_json_object(
+        '[{"id": 1, "text_zh": "a"}]\n\n以上是翻译结果，请确认。'
+    ) == [{"id": 1, "text_zh": "a"}]
+    # 尾部说明里带括号：旧实现的 rfind 截取会失败，新实现只吃首个 JSON 值。
+    assert _extract_json_object(
+        '[{"id": 1, "text_zh": "a"}]\n以上是翻译结果（格式参考 [{"id": 9}]）。'
+    ) == [{"id": 1, "text_zh": "a"}]
+
+
+def test_extract_json_object_handles_fenced_json_with_trailing_note() -> None:
+    """反例 c：代码围栏 + 围栏外说明文字 -> 仍取出围栏内的 JSON。"""
+
+    fenced = '```json\n[{"id": 1, "text_zh": "a"}]\n```\n以上是翻译'
+    assert _extract_json_object(fenced) == [{"id": 1, "text_zh": "a"}]
+    # 围栏外说明带括号（旧实现围栏识别失败 + rfind 截取失败，必抛 Extra data）。
+    assert _extract_json_object(
+        '```json\n[{"id": 1, "text_zh": "a"}]\n```\n以上是翻译（示例 [{"id": 9}]）'
+    ) == [{"id": 1, "text_zh": "a"}]
+    # 只有起始围栏（上游输出被截断）时同样要能取出 JSON。
+    assert _extract_json_object('```json\n[{"id": 1, "text_zh": "a"}]') == [
+        {"id": 1, "text_zh": "a"}
+    ]
+
+
+def test_extract_json_object_raises_when_no_json_at_all() -> None:
+    """反例 d：完全无 JSON 的文本 -> 必须抛错，不得静默返回空结果。
+
+    错误类型保持"可重试的 parse 类"：`_error_class()` 归为 parse，
+    `_is_retryable()` 为 True（与 json.loads 抛 JSONDecodeError 的旧行为一致），
+    因此不会把"模型只吐了纯文本"误判成不可重试错误而放弃重试。
+    """
+
+    with pytest.raises(JsonExtractionError) as excinfo:
+        _extract_json_object("抱歉，我无法完成这次翻译。")
+
+    assert isinstance(excinfo.value, ValueError)
+    assert _error_class(excinfo.value) == "parse"
+    assert _is_retryable(excinfo.value) is True
+
+
+def test_extract_json_object_skips_leading_value_without_required_fields() -> None:
+    """首个 JSON 值缺字段/为空时，改用后面出现的下一个 JSON 值。
+
+    真实场景：上游先吐一段元数据/空对象，再给真正的数组。此时 `required_keys`
+    判定首个值"不可用"，继续解码后续 JSON 值；上下文无关的正文不会被误判。
+    """
+
+    expected = [{"id": 1, "text_zh": "a"}]
+    assert (
+        _extract_json_object(
+            '{"note": "ok"}\n[{"id": 1, "text_zh": "a"}]',
+            required_keys=("id", "text_zh"),
+        )
+        == expected
+    )
+    assert (
+        _extract_json_object(
+            '{}\n[{"id": 1, "text_zh": "a"}]', required_keys=("id", "text_zh")
+        )
+        == expected
+    )
+
+
+def test_real_api_concatenated_arrays_completed_by_c5_subset_retry(
+    tmp_path: Path,
+) -> None:
+    """真实路径 a：两段数组拼接 -> 首轮只解析出 id1，C.5 只补缺失的 id2。
+
+    不 mock `_call_translate_api`：post_func 返回"数组 + 数组 + 说明文字"的
+    content，首轮解析出 id1 后被接受，第二轮只请求缺失的 id2（幂等键已变），
+    最终两条字幕都有译文——旧实现这里会直接 parse 失败、整批耗尽 8 次重试。
+    """
+
+    config_path = _write_config(
+        tmp_path / "config.ini",
+        translation_lines=["batch_size = 10", "retry = 3", "request_interval = 0"],
+    )
+    ja = _make_srt(tmp_path / "sample.ja.srt", 2)
+    output = tmp_path / "sample.zh.srt"
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"x")
+
+    requested: list[list[int]] = []
+    lock = threading.Lock()
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        ids = _requested_ids(kwargs)
+        with lock:
+            requested.append(ids)
+            first = len(requested) == 1
+        if not first:
+            return _content_http(
+                json.dumps(
+                    [{"id": i, "text_zh": f"zh-{i}"} for i in ids], ensure_ascii=False
+                )
+            )
+        # 真实反例：两个 JSON 数组直接拼接，尾部再挂一句说明文字。
+        content = json.dumps([{"id": 1, "text_zh": "zh-1"}], ensure_ascii=False)
+        content += json.dumps([{"id": 2, "text_zh": "zh-2"}], ensure_ascii=False)
+        content += "\n以上是翻译"
+        return _content_http(content)
+
+    run_translate(
+        ja,
+        output,
+        config_path=config_path,
+        timeout_sec=30,
+        input_video_path=video,
+        post_func=post,
+        defer_copy_back=True,
+    )
+
+    assert requested[0] == [1, 2]
+    assert requested[1] == [2]  # C.5：只补缺失，不整批重发
+    text = output.read_text(encoding="utf-8")
+    assert "zh-1" in text
+    assert "zh-2" in text
+
+
+def test_real_api_trailing_prose_after_full_array_needs_no_retry(
+    tmp_path: Path,
+) -> None:
+    """真实路径 b：完整数组 + 尾部说明（含括号示例）-> 单轮成功，不补缺失。
+
+    尾部说明里带方括号时旧实现必坏（rfind 截取把说明也包进来 -> Extra data），
+    这正是线上 `line 1 column 31 (char 30)` 的形状；新实现只吃首个 JSON 值，
+    尾部那段示例 `[{"id": 9, ...}]` 也不会被当成"多余 id"去触发重试。
+    """
+
+    config_path = _write_config(
+        tmp_path / "config.ini",
+        translation_lines=["batch_size = 10", "retry = 3", "request_interval = 0"],
+    )
+    ja = _make_srt(tmp_path / "sample.ja.srt", 2)
+    output = tmp_path / "sample.zh.srt"
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"x")
+
+    calls: list[list[int]] = []
+    lock = threading.Lock()
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        ids = _requested_ids(kwargs)
+        with lock:
+            calls.append(ids)
+        body = json.dumps(
+            [{"id": i, "text_zh": f"zh-{i}"} for i in ids], ensure_ascii=False
+        )
+        # 尾部说明里带方括号示例：旧实现截到最后一位 ] 必抛 Extra data。
+        return _content_http(
+            body + '\n\n以上是翻译结果，请查收（格式参考 [{"id": 9, "text_zh": "示例"}]）。'
+        )
+
+    run_translate(
+        ja,
+        output,
+        config_path=config_path,
+        timeout_sec=30,
+        input_video_path=video,
+        post_func=post,
+        defer_copy_back=True,
+    )
+
+    assert calls == [[1, 2]]  # 一次成功，没有多余请求
+    text = output.read_text(encoding="utf-8")
+    assert "zh-1" in text
+    assert "zh-2" in text
+
+
+def test_real_api_garbage_content_fails_loudly_and_stays_retryable(
+    tmp_path: Path,
+) -> None:
+    """真实路径 d：上游只回纯文本 -> 不得静默成功；按可重试 parse 错误重试后失败。"""
+
+    config_path = _write_config(
+        tmp_path / "config.ini",
+        translation_lines=["batch_size = 10", "retry = 2", "request_interval = 0"],
+    )
+    ja = _make_srt(tmp_path / "sample.ja.srt", 2)
+    output = tmp_path / "sample.zh.srt"
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"x")
+
+    calls: list[list[int]] = []
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(_requested_ids(kwargs))
+        return _content_http("抱歉，我无法完成这次翻译。")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        run_translate(
+            ja,
+            output,
+            config_path=config_path,
+            timeout_sec=30,
+            input_video_path=video,
+            post_func=post,
+            defer_copy_back=True,
+        )
+
+    assert "translate batch failed" in str(excinfo.value)
+    assert len(calls) == 2  # parse 类错误可重试：retry=2 -> 共 2 次请求
+    assert calls[0] == [1, 2]
+    assert not output.exists()  # 失败不落产物：绝不静默产出空/半截字幕
