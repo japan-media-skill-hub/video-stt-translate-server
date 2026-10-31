@@ -142,13 +142,17 @@ class TranslatePartialIdsError(ValueError):
     def __init__(
         self,
         missing: list[int],
-        unexpected: list[int],
+        unexpected: list[int | str],
         partial: dict[int, str] | None = None,
     ) -> None:
         """记录缺失与多余的 id，并保留已成功解析的译文子集。
 
         `partial` 必须随异常一起带出：否则调用方拿不到"已成功的那部分"，
         C.5 的"先接受已有、只补缺失"就会退化为整批重发并把已得译文丢掉。
+
+        `unexpected` 允许混入字符串：新契约（以 id 为 key 的对象）下模型可能返回
+        根本不是数字的 key（例如 `"note"`），这类 key 同样要上报为"多余"，但保留
+        原始字面量便于排障，不强行转成 int（转了就会丢掉"它是什么"这条线索）。
         """
 
         self.missing = missing
@@ -158,6 +162,89 @@ class TranslatePartialIdsError(ValueError):
             f"batch translation ids mismatch, missing={missing[:10]} "
             f"unexpected={unexpected[:10]}"
         )
+
+
+def _coerce_translate_id(raw_id: Any) -> int | None:
+    """把模型返回的 id（对象 key 或旧数组的 `id` 字段）转成 int；不可转时返回 None。
+
+    新契约里 key 一定是字符串（`{"84": "..."}`），旧数组里是 JSON 数字；两种都要能
+    认出来。`bool` 是 `int` 的子类，必须显式排除，否则 `True` 会被当成 id 1。
+    """
+
+    if isinstance(raw_id, bool):
+        return None
+    if isinstance(raw_id, int):
+        return raw_id
+    if isinstance(raw_id, str):
+        text = raw_id.strip()
+        if not text:
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_translate_mapping(
+    parsed: Any, expected: set[int]
+) -> tuple[dict[int, str], list[int], list[int | str]]:
+    """把模型输出解析成 `(id -> 译文, missing, unexpected)`，兼容两种契约。
+
+    形态 (a) 新契约：**以 id 为 key 的 JSON 对象** `{"84": "中文", ...}`——key 直接
+    就是 id（字符串或整数，统一 `int()` 归一），value 是该 id 的译文。
+    形态 (b) 旧契约：对象数组 `[{"id": 84, "text_zh": "中文"}]`，向后兼容。
+
+    为什么新契约能修"整段后移一位"：数组契约只校验「id 集合相等」，模型把一条日文
+    拆成两条、又丢掉最后一条时返回的 id 仍可能是连续的 84..107，集合相等 → 校验通过，
+    但译文与 id 的对应关系已经整体错位一格。改成 key 绑定后，每条译文只能落到它自己
+    的 id 上，"少一条"只会表现为**缺 key**（进 C.5 只补缺失），"多一条/多个 key"表现
+    为 unexpected，绝不可能静默产出错位字幕。
+
+    校验语义：
+    - key 集合必须与批次 id 集合完全一致；缺失 → `missing`；
+    - 多余 id、无法 `int()` 的 key → `unexpected`（保留原始字面量便于排障）；
+    - 空字符串 / 非字符串 value 按**缺失**处理（绝不写入空字幕）；
+    - 非 dict 非 list 的载荷直接抛 `ValueError`（parse 类，可重试），不静默放行。
+    """
+
+    mapping: dict[int, str] = {}
+    unexpected: list[int | str] = []
+
+    def _accept(raw_id: Any, raw_text: Any) -> None:
+        """按 id 收一条译文；无法归位的 id/value 记入 unexpected 或按缺失留白。"""
+
+        item_id = _coerce_translate_id(raw_id)
+        if item_id is None:
+            # 不是数字的 key：同样要上报，但保留原文（转了 int 就丢掉线索）。
+            unexpected.append(raw_id if isinstance(raw_id, str) else repr(raw_id))
+            return
+        if item_id not in expected:
+            # 仅接受本批 id，避免模型串批写入错误字幕。
+            unexpected.append(item_id)
+            return
+        if isinstance(raw_text, str) and raw_text.strip():
+            mapping[item_id] = raw_text.strip()
+        # 空串/非字符串：有意不收，由 missing 触发 C.5 只补该 id，绝不写空字幕。
+
+    if isinstance(parsed, dict):
+        for raw_key, raw_value in parsed.items():
+            _accept(raw_key, raw_value)
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            _accept(item.get("id"), item.get("text_zh"))
+    else:
+        raise ValueError(
+            "model output is neither a JSON object (id -> text) nor an array"
+        )
+
+    missing = sorted(expected - set(mapping))
+    # 数字 id 先按数值排序，非数字 key 再按字面量排序，保证日志稳定可对比。
+    unexpected_ids = sorted({u for u in unexpected if isinstance(u, int)})
+    unexpected_keys = sorted({u for u in unexpected if not isinstance(u, int)})
+    return mapping, missing, unexpected_ids + unexpected_keys
 
 
 def _call_translate_api(
@@ -200,35 +287,14 @@ def _call_translate_api(
     # 第一个可用 JSON 值并忽略尾部（合并会把模型附带的格式示例当成译文）。
     # 首个值若缺 id，下面的 id 校验照旧抛 `TranslatePartialIdsError`（含 partial），
     # 由调用方 C.5"接受子集 + 只补缺失 + 保留原文"兜底，语义不变。
-    parsed = _extract_json_object(content, required_keys=("id", "text_zh"))
-    if not isinstance(parsed, list):
-        raise ValueError("model output is not a JSON array")
+    # 对齐契约修复：`accept_id_keyed=True` 让"以 id 为 key 的对象"也算可用载荷，
+    # 与旧数组契约并存（见 `_parse_translate_mapping`）。
+    parsed = _extract_json_object(
+        content, required_keys=("id", "text_zh"), accept_id_keyed=True
+    )
 
     expected = {e.index for e in batch}
-    mapping: dict[int, str] = {}
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        item_id = item.get("id")
-        text_zh = item.get("text_zh")
-        # 仅接受本批 id，避免模型串批写入错误字幕。
-        if (
-            isinstance(item_id, int)
-            and item_id in expected
-            and isinstance(text_zh, str)
-            and text_zh.strip()
-        ):
-            mapping[item_id] = text_zh.strip()
-    missing = sorted(expected - set(mapping.keys()))
-    unexpected = sorted(
-        {
-            item.get("id")
-            for item in parsed
-            if isinstance(item, dict)
-            and isinstance(item.get("id"), int)
-            and item["id"] not in expected
-        }
-    )
+    mapping, missing, unexpected = _parse_translate_mapping(parsed, expected)
     if missing or unexpected:
         # C.5：把"已成功解析的子集"一并抛出，调用方据此只补缺失 id 并保留已得译文。
         raise TranslatePartialIdsError(

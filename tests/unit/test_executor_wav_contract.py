@@ -15,10 +15,16 @@ import pytest
 from whisper_stt_service.executor.common import (
     ExecutorCancelledError,
     MissingAudioArtifactError,
+    _timestamp_to_seconds,
+    clean_segment_timeline,
+    coerce_max_segment_sec,
 )
 from whisper_stt_service.executor.extract import run_extract
 from whisper_stt_service.executor.stt import run_stt
-from whisper_stt_service.executor.stt_whisperx import run_stt_whisperx
+from whisper_stt_service.executor.stt_whisperx import (
+    _render_whisperx_srt,
+    run_stt_whisperx,
+)
 from whisper_stt_service.service.model_cache import reset_model_cache_for_tests
 
 
@@ -884,3 +890,206 @@ def test_run_extract_cancel_kills_ffmpeg_and_cleans_temp(tmp_path: Path, monkeyp
     assert state["procs"][0].killed is True
     assert not out.exists()
     assert not Path(state["output"]).exists()
+
+# --------------------------- 字幕时间戳兜底：单调不重叠 + 单段 <= 30s + lookahead
+#
+# 真实影片实测（ADN 10 段 >30s，MIDA 39 段）：faster-whisper 在长静音处把段级
+# end 预测到 886.7s / 489.9s。已确认时间戳来自模型段级预测（同参数重跑可复现
+# 24s 段），**不是**后处理造成，因此只能在下游写字幕前兜底收紧：
+# 文本绝不修改、条数不增减，只保证单调不重叠、单段不超长、并在下一句开口前结束。
+
+
+def _srt_spans(content: str) -> tuple[list[str], list[tuple[float, float]]]:
+    """解析 SRT，返回 (按出现顺序的文本列表, 时间轴区间列表)。"""
+
+    texts: list[str] = []
+    spans: list[tuple[float, float]] = []
+    for block in content.split("\n\n"):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        start_text, end_text = lines[1].split("-->", 1)
+        spans.append(
+            (
+                _timestamp_to_seconds(start_text.strip()),
+                _timestamp_to_seconds(end_text.strip()),
+            )
+        )
+        texts.append("\n".join(lines[2:]))
+    return texts, spans
+
+
+def _assert_sanitized(spans: list[tuple[float, float]], limit: float = 30.0) -> None:
+    """断言清洗后的时间轴单调、互不重叠、单段不超过 limit。"""
+
+    for start_sec, end_sec in spans:
+        assert end_sec > start_sec, f"零/负长度段未被修正: {start_sec}->{end_sec}"
+        assert end_sec - start_sec <= limit + 1e-6, (
+            f"单段超过 {limit}s: {start_sec}->{end_sec}"
+        )
+    for prev, cur in zip(spans, spans[1:]):
+        assert cur[0] >= prev[1] - 1e-9, f"时间轴不单调: {prev} -> {cur}"
+
+
+def test_run_stt_sanitizes_absurd_and_overlapping_segments(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """886.7s 超长 + 乱序 + 零长度 + 重叠：时间收紧，文本与条数完全不变。"""
+
+    _quiet_progress(monkeypatch)
+    _install_fake_faster_whisper(
+        monkeypatch,
+        _segs(
+            ("一", 100.0, 986.7),  # 真实反例形状：单段 886.7s
+            ("二", 990.0, 991.0),
+            ("三", 5.0, 6.0),  # 乱序：早于上一条 end
+            ("四", 7.0, 7.0),  # 零长度
+            ("五", 8.0, 40.0),  # 与上面重叠 + 超长
+            ("六", 9.0, 12.0),
+        ),
+    )
+    wav = _audio(tmp_path)
+    out = tmp_path / "demo.ja.srt"
+
+    run_stt(
+        wav,
+        out,
+        language="ja",
+        timeout_sec=60,
+        model="/m",
+        device="cpu",
+        compute_type="int8",
+        batch_size=1,
+        require_audio_artifact=True,
+    )
+
+    texts, spans = _srt_spans(out.read_text(encoding="utf-8"))
+    assert texts == ["一", "二", "三", "四", "五", "六"]  # 文本绝不修改
+    assert len(spans) == 6  # 条数不增减
+    _assert_sanitized(spans)
+    # 886.7s 的段被截到 start + 30s（而不是原样写出）
+    assert spans[0] == (100.0, 130.0)
+
+
+def test_run_stt_timestamps_are_monotonic_in_file_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """所有输出段的 end 都不超过下一条的 start（lookahead 收紧 + 单调保证）。"""
+
+    _quiet_progress(monkeypatch)
+    _install_fake_faster_whisper(
+        monkeypatch,
+        _segs(*[(f"s{i}", i * 2.0, i * 2.0 + 1.5) for i in range(5)]),
+    )
+    wav = _audio(tmp_path)
+    out = tmp_path / "demo.ja.srt"
+
+    run_stt(wav, out, language="ja", timeout_sec=60, model="/m", device="cpu")
+
+    _texts, spans = _srt_spans(out.read_text(encoding="utf-8"))
+    _assert_sanitized(spans)
+    # 正常段（end < 下一条 start）不被改写。
+    assert spans == [(0.0, 1.5), (2.0, 3.5), (4.0, 5.5), (6.0, 7.5), (8.0, 9.5)]
+
+
+def test_run_stt_lookahead_tightens_end_to_next_start(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """lookahead：end 越过下一条 start 时收紧到 next.start；最后一条不收紧。"""
+
+    _quiet_progress(monkeypatch)
+    _install_fake_faster_whisper(
+        monkeypatch,
+        _segs(
+            ("一", 0.0, 10.0),  # 越过下一条起点 4.0
+            ("二", 4.0, 6.0),
+            ("三", 20.0, 70.0),  # 最后一条：没有 next.start，只受 30s 上限
+        ),
+    )
+    wav = _audio(tmp_path)
+    out = tmp_path / "demo.ja.srt"
+
+    run_stt(wav, out, language="ja", timeout_sec=60, model="/m", device="cpu")
+
+    _texts, spans = _srt_spans(out.read_text(encoding="utf-8"))
+    assert spans[0] == (0.0, 4.0)  # 被下一条的 start 收紧
+    assert spans[1] == (4.0, 6.0)
+    assert spans[2] == (20.0, 50.0)  # 最后一条：50s 被截到 30s 上限
+    _assert_sanitized(spans)
+
+
+def test_run_stt_logs_warning_summary_when_timestamps_sanitized(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    """清洗发生时记录一条 WARNING 汇总（条数/最大原始时长），便于观测。"""
+
+    _quiet_progress(monkeypatch)
+    _install_fake_faster_whisper(
+        monkeypatch, _segs(("一", 0.0, 886.7), ("二", 900.0, 901.0))
+    )
+    wav = _audio(tmp_path)
+    out = tmp_path / "demo.ja.srt"
+    caplog.set_level("WARNING")
+
+    run_stt(wav, out, language="ja", timeout_sec=60, model="/m", device="cpu")
+
+    assert "timestamps sanitized" in caplog.text
+    assert "adjusted=1" in caplog.text
+    assert "max_original=886.7s" in caplog.text
+    assert "max_segment_sec=30.0s" in caplog.text
+
+
+def test_clean_segment_timeline_honours_custom_limit_and_reports_stats() -> None:
+    """纯函数：自定义单段上限生效，统计量可供日志审计。"""
+
+    stats: dict = {}
+    out = list(
+        clean_segment_timeline(
+            [("a", 0.0, 100.0), ("b", 101.0, 102.0)],
+            max_segment_sec=5,
+            stats=stats,
+        )
+    )
+
+    assert [(t, s, e) for t, s, e in out] == [
+        ("a", 0.0, 5.0),
+        ("b", 101.0, 102.0),
+    ]
+    assert stats["total"] == 2
+    assert stats["adjusted"] == 1
+    assert stats["max_original_sec"] == 100.0
+    assert stats["max_output_sec"] == 5.0
+    assert stats["max_segment_sec"] == 5.0
+
+
+def test_coerce_max_segment_sec_falls_back_on_invalid_values() -> None:
+    """非法 max_segment_sec（非数值/<=0/非有限）回退默认 30s。"""
+
+    for bad in ("abc", "", None, -1, 0, float("nan"), float("inf")):
+        assert coerce_max_segment_sec(bad) == 30.0
+    assert coerce_max_segment_sec("12.5") == 12.5
+    assert coerce_max_segment_sec(8) == 8.0
+
+
+def test_render_whisperx_srt_sanitizes_without_touching_text() -> None:
+    """stt_whisperx 同样透传段级 start/end：渲染前清洗，文本与条数不变。"""
+
+    stats: dict = {}
+    rendered, count, last_end = _render_whisperx_srt(
+        [
+            {"text": " ありがとう ", "start": 100.0, "end": 986.7},
+            {"text": "ございます", "start": 990.0, "end": 991.0},
+            {"text": "   ", "start": 0.0, "end": 1.0},  # 空段不产生字幕行
+        ],
+        max_segment_sec=30.0,
+        timestamp_stats=stats,
+    )
+
+    texts, spans = _srt_spans(rendered)
+    assert texts == ["ありがとう", "ございます"]  # 只 strip，不改写
+    assert count == 2
+    assert last_end == 991.0
+    _assert_sanitized(spans)
+    assert spans[0] == (100.0, 130.0)
+    assert stats["adjusted"] == 1
+    assert stats["total"] == 2

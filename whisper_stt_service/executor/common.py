@@ -6,6 +6,7 @@ import configparser
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -14,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Full, Queue
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from whisper_stt_service.executor.atomic import atomic_write_text
 
@@ -72,6 +73,171 @@ def _entry_start_seconds(timestamp: str) -> float:
         return _timestamp_to_seconds(start_text)
     except Exception:
         return 0.0
+
+
+# 字幕单段最长时长（秒）：faster-whisper 的段级时间预测在长静音处会把 end
+# 预测得极远（实测 A/D 影片出现 886.7s、489.9s），单段跨度过大在播放器里表现为
+# "字幕长时间不切换"。这不是后处理造成的，只能在下游写字幕前兜底收紧。
+DEFAULT_MAX_SEGMENT_SEC = 30.0
+
+# 单段最短时长（秒）：end <= start 的零长度/倒挂段给一个可播放的最小时长。
+MIN_SEGMENT_SEC = 0.3
+
+# 时间戳相等判定容差：清洗前后差异小于该值视为"未调整"（1ms 是 SRT 精度）。
+_TIMESTAMP_EPSILON = 1e-6
+
+
+def coerce_max_segment_sec(
+    value: Any, default: float = DEFAULT_MAX_SEGMENT_SEC
+) -> float:
+    """归一化「单段最长时长」配置：非数值/非有限/<=0 一律回退默认值。
+
+    `effective_config` 里的值可能来自任务配置字符串（例如 "30" 或 "abc"），
+    这里统一转成可直接比较的浮点，绝不因为配置写错而把字幕切坏或抛异常。
+    """
+
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(parsed) or parsed <= 0:
+        return float(default)
+    return parsed
+
+
+def _clean_segment_bounds(
+    *,
+    start: float,
+    end: float,
+    prev_end: float,
+    next_start: float | None,
+    max_segment_sec: float,
+) -> tuple[float, float]:
+    """按清洗规则算出一段的 (start, end)；只动时间，不碰文本。
+
+    规则顺序即语义（顺序不可交换）：
+    1. `start` 不早于上一条 `end`，且不为负 → 乱序/重叠段被推后，保证单调；
+    2. `end <= start`（零长度/倒挂）→ `start + MIN_SEGMENT_SEC`；
+    3. 单段超过 `max_segment_sec` → 截到 `start + max_segment_sec`；
+    4. lookahead 收紧：`end = min(end, 下一条 start)`，最后一条不收紧；
+    5. 收紧后仍 `end <= start` → 再补最小 0.3s（下一条会被规则 1 推后，不会重叠）。
+    """
+
+    cleaned_start = max(float(start), 0.0)
+    if cleaned_start < prev_end:
+        cleaned_start = prev_end
+    cleaned_end = float(end)
+    if cleaned_end <= cleaned_start:
+        cleaned_end = cleaned_start + MIN_SEGMENT_SEC
+    if cleaned_end - cleaned_start > max_segment_sec:
+        cleaned_end = cleaned_start + max_segment_sec
+    if next_start is not None and cleaned_start < next_start < cleaned_end:
+        # 下一句已经开口：本句不得越过它的起点（最后一条没有 next_start）。
+        cleaned_end = next_start
+    if cleaned_end <= cleaned_start:
+        cleaned_end = cleaned_start + MIN_SEGMENT_SEC
+    return cleaned_start, cleaned_end
+
+
+def _log_timestamp_cleanup_summary(
+    stats: dict[str, Any] | None,
+    *,
+    stage: str,
+    task_id: str | None = None,
+) -> None:
+    """记录一条字幕时间戳清洗汇总，便于观测"到底有没有超长/错乱段"。
+
+    `adjusted > 0`（确实改了时间）时用 WARNING：这是真实影片里出现过 886.7s 超长段
+    的信号，必须能在日志里被看到；没改动时降到 INFO，避免每部正常影片都刷一条告警
+    把真正的 WARNING 淹没。`stats` 为空（循环未跑完/提前异常）时直接返回。
+    """
+
+    if not stats:
+        return
+    level = logger.warning if int(stats.get("adjusted", 0)) > 0 else logger.info
+    level(
+        "%s timestamps sanitized: task_id=%s total=%d adjusted=%d "
+        "max_original=%.1fs max_output=%.1fs max_segment_sec=%.1fs",
+        stage,
+        task_id,
+        int(stats.get("total", 0)),
+        int(stats.get("adjusted", 0)),
+        float(stats.get("max_original_sec", 0.0)),
+        float(stats.get("max_output_sec", 0.0)),
+        float(stats.get("max_segment_sec", DEFAULT_MAX_SEGMENT_SEC)),
+    )
+
+
+def clean_segment_timeline(
+    segments: Iterable[tuple[str, float, float]],
+    *,
+    max_segment_sec: float = DEFAULT_MAX_SEGMENT_SEC,
+    stats: dict[str, Any] | None = None,
+) -> Iterator[tuple[str, float, float]]:
+    """把 ASR 段级时间戳清洗成「单调不重叠 + 单段不超长」的字幕时间轴。
+
+    输入/输出都是 `(text, start_sec, end_sec)`：**文本原样透传，绝不增删条目**，
+    调用方负责先把空文本段过滤掉（空段没有字幕行，不该参与 lookahead）。
+
+    清洗规则见 `_clean_segment_bounds`；lookahead 用「下一条的 start」收紧上一段，
+    因此本生成器会缓冲一条：只有读到下一条（或流结束）才产出上一段。
+
+    `stats` 可选传入 dict，耗尽后填入汇总（供调用方记录一条 WARNING）：
+    `total`/`adjusted`/`max_original_sec`/`max_output_sec`/`max_segment_sec`。
+    """
+
+    limit = coerce_max_segment_sec(max_segment_sec)
+    total = 0
+    adjusted = 0
+    max_original = 0.0
+    max_output = 0.0
+    prev_end = 0.0
+    pending: tuple[str, float, float] | None = None
+
+    def _finalize(
+        item: tuple[str, float, float], next_start: float | None
+    ) -> tuple[str, float, float]:
+        """把一条缓冲段清洗后返回，并累计统计量。"""
+
+        nonlocal adjusted, max_original, max_output, prev_end
+        text, start, end = item
+        cleaned_start, cleaned_end = _clean_segment_bounds(
+            start=start,
+            end=end,
+            prev_end=prev_end,
+            next_start=next_start,
+            max_segment_sec=limit,
+        )
+        if (
+            abs(cleaned_start - start) > _TIMESTAMP_EPSILON
+            or abs(cleaned_end - end) > _TIMESTAMP_EPSILON
+        ):
+            adjusted += 1
+        # 原始时长按字面记录（含倒挂段的负值归零），仅用于观测与告警。
+        max_original = max(max_original, max(end - start, 0.0))
+        max_output = max(max_output, max(cleaned_end - cleaned_start, 0.0))
+        prev_end = cleaned_end
+        return text, cleaned_start, cleaned_end
+
+    for text, raw_start, raw_end in segments:
+        current = (text, float(raw_start), float(raw_end))
+        total += 1
+        if pending is not None:
+            yield _finalize(pending, current[1])
+        pending = current
+    if pending is not None:
+        yield _finalize(pending, None)
+
+    if stats is not None:
+        stats.update(
+            {
+                "total": total,
+                "adjusted": adjusted,
+                "max_original_sec": max_original,
+                "max_output_sec": max_output,
+                "max_segment_sec": limit,
+            }
+        )
 
 
 def _emit_progress(
@@ -361,9 +527,17 @@ def _sha256_file(path: Path) -> str:
 
 
 def _build_translate_messages(batch: list[SrtEntry]) -> list[dict[str, str]]:
-    """构造翻译消息，强调剧情上下文推理和全段一致性。"""
+    """构造翻译消息，强调剧情上下文推理和全段一致性。
+
+    输出契约（修复"整段后移一位"）：从「对象数组 [{id, text_zh}]」改为「以 id 为
+    key 的 JSON 对象 {'<id>': '<中文>'}」。数组契约下模型偶发把一条日文拆成
+    两条、又丢掉最后一条时，返回的 id 仍可能是连续的 84..107，本地只校验「id 集合
+    相等」就发现不了，整段译文后移一位。改成 id 作为 key 后，译文与 id 的绑定由
+    解析层直接按 key 建立，不再依赖数组位置，行数也不再需要和长度对齐。
+    """
 
     payload_items = [{"id": e.index, "text": e.text} for e in batch]
+    item_count = len(payload_items)
     system_prompt = (
         "You are a professional subtitle translator. Translate Japanese subtitles into natural, concise "
         "Simplified Chinese. Use context and plot continuity to infer omitted subjects, keep naming and tone "
@@ -374,9 +548,18 @@ def _build_translate_messages(batch: list[SrtEntry]) -> list[dict[str, str]]:
         "output ONLY JSON."
     )
     user_prompt = (
-        "Translate the following JSON array from Japanese to Simplified Chinese subtitles. "
-        "Return ONLY a JSON array with objects in the form: "
-        '{"id": <same id>, "text_zh": "..."}. Keep the same ids and same item count. '
+        "Translate the following JSON array of Japanese subtitles into Simplified Chinese subtitles. "
+        f"The input contains exactly {item_count} subtitle items, each with a numeric \"id\". "
+        "Return ONLY ONE JSON object that maps every input id, as a string key, to that single "
+        'item\'s Chinese translation string, i.e. {"<id>": "<Chinese translation>", ...}. '
+        "Hard constraints on the output object:\n"
+        f"- it MUST have exactly one key for EVERY input id ({item_count} keys in total, "
+        "no more, no fewer) and no other keys;\n"
+        "- never merge two input items into one entry, never split one input item into several "
+        "entries, and never add, drop or renumber ids: the number of keys MUST equal the number "
+        "of input items;\n"
+        "- every value is one single string (no nested objects/arrays), and it must translate only "
+        "the text of its own id.\n"
         "For repetitive filler words, perform intelligent denoising and output fluent subtitles.\n\n"
         f"{json.dumps(payload_items, ensure_ascii=False)}"
     )
@@ -472,16 +655,46 @@ def _iter_json_values(payload: str) -> Iterator[tuple[int, Any]]:
         index = end
 
 
+def _looks_like_id_keyed_payload(value: Any) -> bool:
+    """判断值是否是「以 id 为 key 的 JSON 对象」（新版翻译输出契约）。
+
+    只做形状判定：非空对象、且**每个** key 都能 `int()` 成整数。JSON 对象的 key
+    永远是字符串（`{"84": "..."}`），这里同时接受字符串与整数 key，便于单测直接
+    构造 Python dict。任一 key 不是数字即判定失败——避免把 `{"note": "ok"}` 这类
+    元数据对象当成译文载荷。
+    """
+
+    if not isinstance(value, dict) or not value:
+        return False
+    for key in value:
+        if isinstance(key, bool) or not isinstance(key, (str, int)):
+            return False
+        try:
+            int(str(key).strip())
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def _looks_like_expected_payload(
-    value: Any, required_keys: tuple[str, ...] | None
+    value: Any,
+    required_keys: tuple[str, ...] | None,
+    *,
+    accept_id_keyed: bool = False,
 ) -> bool:
     """判断某个 JSON 值是否"像想要的载荷"（决定是否跳过它继续看下一个值）。
 
     未指定 `required_keys` 时只排除 None/空容器；指定后要求对象本身、或数组里
     至少一个元素命中其中一个字段名——用于跨过上游偶尔先吐出来的空对象/元数据
     对象（例如先 `{"note": "ok"}` 再给真正的数组）。
+
+    `accept_id_keyed=True` 时额外把「以 id 为 key 的对象」视为可用载荷：新契约
+    下模型返回 `{"84": "..."}`，其 key 不是 `id`/`text_zh` 这类字段名，若不加这条
+    判定，前面若先出现一个元数据对象就会把它当载荷返回。
     """
 
+    if accept_id_keyed and _looks_like_id_keyed_payload(value):
+        return True
     if required_keys is None:
         if isinstance(value, (dict, list)):
             return bool(value)
@@ -497,7 +710,10 @@ def _looks_like_expected_payload(
 
 
 def _extract_json_object(
-    text: str, *, required_keys: tuple[str, ...] | None = None
+    text: str,
+    *,
+    required_keys: tuple[str, ...] | None = None,
+    accept_id_keyed: bool = False,
 ) -> Any:
     """从模型返回文本中提取 JSON 对象/数组。
 
@@ -522,6 +738,10 @@ def _extract_json_object(
     （如 `[{"id": 1, "text_zh": "..."}]`），合并会把示例当成译文写进字幕。
     首个值缺 id 时不会丢整批：调用方 C.5 会先接受已返回的子集、只补缺失 id，
     最后仍缺的照旧保留日文原文，绝不丢字幕行。
+
+    `accept_id_keyed=True` 时，除了 `required_keys` 命中的对象/数组，**以 id 为 key
+    的对象**（新契约 `{"84": "..."}`）同样算"可用载荷"，见
+    `_looks_like_expected_payload`。`required_keys` 与它的判定是"或"关系。
     """
 
     payload = text.strip()
@@ -541,7 +761,9 @@ def _extract_json_object(
         # 明确失败（可重试的 parse 类错误）：绝不返回空结果让上层当成"翻译完了"。
         raise JsonExtractionError("unable to extract JSON value from response")
     for _offset, value in candidates:
-        if _looks_like_expected_payload(value, required_keys):
+        if _looks_like_expected_payload(
+            value, required_keys, accept_id_keyed=accept_id_keyed
+        ):
             return value
     # 形状都不符合预期：退回首个值，交由上层按既有契约判定（不在这里吞掉）。
     return candidates[0][1]

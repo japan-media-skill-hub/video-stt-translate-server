@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from queue import Queue
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import importlib
 import logging
 import os
@@ -12,10 +12,14 @@ import tempfile
 import time
 
 from whisper_stt_service.executor.common import (
+    DEFAULT_MAX_SEGMENT_SEC,
     ExecutorCancelledError,
     MissingAudioArtifactError,
     _emit_progress,
+    _log_timestamp_cleanup_summary,
     _probe_duration,
+    clean_segment_timeline,
+    coerce_max_segment_sec,
 )
 from whisper_stt_service.service.model_cache import get_model_cache
 
@@ -116,21 +120,39 @@ def _check_cancel(cancel_check: CancelCheck | None) -> None:
         raise ExecutorCancelledError("cancelled_by_upstream")
 
 
-def _render_whisperx_srt(segments: list[dict[str, Any]]) -> tuple[str, int, float]:
+def _render_whisperx_srt(
+    segments: list[dict[str, Any]],
+    *,
+    max_segment_sec: float = DEFAULT_MAX_SEGMENT_SEC,
+    timestamp_stats: dict[str, Any] | None = None,
+) -> tuple[str, int, float]:
     """把 WhisperX 段列表渲染成 SRT 文本，返回 (文本, 条数, 最后结束秒)。
 
     先渲染到内存，再一次性原子落盘：任何异常/取消都不会留下半成品字幕。
+
+    WhisperX 同样是"段级 start/end 直接透传"，因此与 stt 一致，在写字幕前统一走
+    `clean_segment_timeline`：单调不重叠、单段 <= `max_segment_sec`、lookahead 收紧。
+    **文本与条数不变**，只收紧时间。`timestamp_stats` 会被填入清洗汇总供调用方记录。
     """
 
     lines: list[str] = []
     count = 0
     last_end = 0.0
-    for seg in segments:
-        text = str(seg.get("text", "")).strip()
-        if not text:
-            continue
-        start_sec = float(seg.get("start", 0.0))
-        end_sec = float(seg.get("end", start_sec))
+
+    def _iter_pairs() -> Iterator[tuple[str, float, float]]:
+        """段 dict → `(text, start, end)`；空文本段不产生字幕行，先过滤再清洗。"""
+
+        for seg in segments:
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            start_sec = float(seg.get("start", 0.0))
+            end_sec = float(seg.get("end", start_sec))
+            yield text, start_sec, end_sec
+
+    for text, start_sec, end_sec in clean_segment_timeline(
+        _iter_pairs(), max_segment_sec=max_segment_sec, stats=timestamp_stats
+    ):
         count += 1
         last_end = end_sec
         lines.append(f"{count}\n")
@@ -290,6 +312,11 @@ def run_stt_whisperx(
         local_files_only=local_files_only,
     )
 
+    # 单段最长时长：`effective_config` 里没有该键时用默认 30s（非法值内部再归一化）。
+    max_segment_sec = coerce_max_segment_sec(
+        effective_config.get("max_segment_sec", DEFAULT_MAX_SEGMENT_SEC)
+    )
+
     model_path = Path(str(effective_config["model"]))
     if not model_path.exists():
         raise FileNotFoundError(f"whisper_model_not_found: {model_path}")
@@ -390,9 +417,19 @@ def run_stt_whisperx(
         if time.perf_counter() - started > timeout_sec:
             raise TimeoutError("stt_whisperx_timeout")
 
-        rendered, count, last_end = _render_whisperx_srt(list(segments))
+        # 时间戳兜底：与 stt 一致，写字幕前收紧超长/重叠段（文本与条数不变）。
+        timestamp_stats: dict[str, Any] = {}
+        rendered, count, last_end = _render_whisperx_srt(
+            list(segments),
+            max_segment_sec=max_segment_sec,
+            timestamp_stats=timestamp_stats,
+        )
         if count == 0:
             raise RuntimeError("stt_whisperx_empty_srt")
+        # 清洗汇总：adjusted>0 说明确实存在超长/错乱段（WARNING 便于观测）。
+        _log_timestamp_cleanup_summary(
+            timestamp_stats, stage="stt_whisperx", task_id=task_id
+        )
 
         # C.7：字幕先写临时文件再 os.replace，保证取消/异常时不留半成品。
         handle = None

@@ -33,7 +33,9 @@ from whisper_stt_service.executor.common import (
 )
 from whisper_stt_service.executor.translate import (
     TranslateCancelledError,
+    TranslatePartialIdsError,
     _build_idempotency_key,
+    _call_translate_api,
     _error_class,
     _is_retryable,
     _load_checkpoint,
@@ -1961,3 +1963,313 @@ def test_real_api_garbage_content_fails_loudly_and_stays_retryable(
     assert len(calls) == 2  # parse 类错误可重试：retry=2 -> 共 2 次请求
     assert calls[0] == [1, 2]
     assert not output.exists()  # 失败不落产物：绝不静默产出空/半截字幕
+
+
+# -------------------------- 对齐契约：以 id 为 key 的 JSON 对象（整段后移一位修复）
+#
+# 真实影片（ADN-783-UC 第 84 条起）故障：模型把一条日文拆成两条中文、又丢掉最后
+# 一条，返回的 id 仍是连续的 84..107——旧契约（对象数组 [{id, text_zh}]）只校验
+# "id 集合相等"，集合相等即通过，于是整段译文后移一位，静默产出错位字幕。
+#
+# 新契约把输出改成"以 id 为 key 的 JSON 对象" {"84": "中文"}：译文与 id 的绑定由
+# key 直接建立，不再依赖数组位置。"少一条/多一条"必然表现为缺 key 或多 key，
+# 即 missing/unexpected，进 C.5（只补缺失）或失败，绝不可能静默错位。
+#
+# 下面用例都不 mock 解析层：只用 post_func 提供 HTTP 响应体，走真实
+# `_call_translate_api()` 与 `run_translate()` 生产路径。
+
+
+def _make_srt_with_ids(path: Path, ids: list[int]) -> Path:
+    """生成指定 id 序列的日文 SRT（时间轴按顺序每秒一条）。
+
+    真实故障样本是 84..107（真实影片第 84 条起），这里保留真实 id 区间，
+    避免"从 1 开始"掩盖 id 偏移类缺陷。
+    """
+
+    def _ts(sec: float) -> str:
+        """秒 -> SRT 时间戳（避免用会超过 59 秒的 f-string 拼法）。"""
+
+        total = int(round(sec * 1000))
+        return (
+            f"{total // 3_600_000:02d}:{total % 3_600_000 // 60_000:02d}:"
+            f"{total % 60_000 // 1000:02d},{total % 1000:03d}"
+        )
+
+    blocks = []
+    for offset, item_id in enumerate(ids):
+        start = float(offset)
+        blocks.append(
+            f"{item_id}\n{_ts(start)} --> {_ts(start + 0.9)}\n源{item_id}\n"
+        )
+    path.write_text("\n".join(blocks), encoding="utf-8")
+    return path
+
+
+def _parse_zh_blocks(content: str) -> dict[int, str]:
+    """把 zh.srt 解析成 {id: 文本}，用于逐条断言"译文落在自己的 id 上"。"""
+
+    result: dict[int, str] = {}
+    for block in content.split("\n\n"):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        result[int(lines[0])] = "\n".join(lines[2:])
+    return result
+
+
+def _batch(ids: list[int]) -> list[SrtEntry]:
+    """构造待翻译批次（只关心 id 与占位日文文本）。"""
+
+    return [
+        SrtEntry(
+            index=i,
+            timestamp=f"00:00:{i:02d},000 --> 00:00:{i:02d},900",
+            text=f"日{i}",
+        )
+        for i in ids
+    ]
+
+
+def _post_returning_dict(mapping: dict[str, str]):
+    """构造"模型返回 {id: 译文} 对象"的 post_func（不 mock 解析层）。"""
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        return _content_http(json.dumps(mapping, ensure_ascii=False))
+
+    return post
+
+
+def _call(batch: list[SrtEntry], post) -> dict[int, str]:  # type: ignore[no-untyped-def]
+    """用给定 HTTP 响应调用真实 `_call_translate_api()`。"""
+
+    return _call_translate_api(
+        post,
+        base_url="https://llm.example/v1",
+        api_key="fake-key",
+        model="fake-model",
+        timeout_sec=10,
+        batch=batch,
+    )
+
+
+def test_dict_contract_batch_succeeds_via_real_parser() -> None:
+    """a) 新 dict 格式正常批次成功：key 直接就是 id，译文按 id 落位。"""
+
+    batch = _batch([84, 85, 86])
+    sent: list[dict] = []
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        sent.append(kwargs)
+        return _content_http(
+            json.dumps(
+                {"84": "中84", "85": "中85", "86": "中86"}, ensure_ascii=False
+            )
+        )
+
+    mapping = _call(batch, post)
+
+    assert mapping == {84: "中84", 85: "中85", 86: "中86"}
+    # 提示词必须要求"以 id 为 key 的对象"，并显式禁止合并/拆分/增删条目。
+    user_prompt = sent[0]["json"]["messages"][1]["content"]
+    assert '"<id>"' in user_prompt
+    assert "exactly 3 subtitle items" in user_prompt
+    assert "never merge" in user_prompt
+    assert "never split" in user_prompt
+    # 输入侧仍是 [{id, text}] 数组：便于逐条对照，也保持与历史请求形状一致。
+    payload = json.loads(user_prompt.split("\n\n", 1)[1])
+    assert [item["id"] for item in payload] == [84, 85, 86]
+    assert payload[0]["text"] == "日84"
+
+
+def test_dict_contract_missing_key_raises_partial_with_exact_ids() -> None:
+    """e) 少一个 key（拆行导致丢条）：必须被检出为 missing，且已得译文不丢。"""
+
+    batch = _batch([84, 85, 86])
+    post = _post_returning_dict({"84": "中84", "85": "中85"})
+
+    with pytest.raises(TranslatePartialIdsError) as excinfo:
+        _call(batch, post)
+
+    error = excinfo.value
+    assert error.missing == [86]
+    assert error.unexpected == []
+    # partial 带出已成功的那部分，C.5 才能只补缺失而不是整批重发。
+    assert error.partial == {84: "中84", 85: "中85"}
+
+
+def test_dict_contract_extra_and_non_numeric_keys_are_reported() -> None:
+    """c) 多一个 key / 非数字 key：都上报 unexpected（不静默放行）。"""
+
+    batch = _batch([1, 2])
+
+    # 多一个不属于本批的 id：模型多写了一条（拆行/串批）。
+    post_extra = _post_returning_dict({"1": "中1", "2": "中2", "99": "多出来"})
+    with pytest.raises(TranslatePartialIdsError) as excinfo:
+        _call(batch, post_extra)
+    assert excinfo.value.unexpected == [99]
+    assert excinfo.value.missing == []
+    assert excinfo.value.partial == {1: "中1", 2: "中2"}
+
+    # key 根本不是数字：保留原始字面量（转 int 会丢掉"它是什么"这条线索）。
+    post_note = _post_returning_dict({"1": "中1", "2": "中2", "note": "以上是翻译"})
+    with pytest.raises(TranslatePartialIdsError) as excinfo2:
+        _call(batch, post_note)
+    assert excinfo2.value.unexpected == ["note"]
+    assert excinfo2.value.missing == []
+    assert excinfo2.value.partial == {1: "中1", 2: "中2"}
+
+
+def test_dict_contract_empty_or_non_string_value_counts_as_missing() -> None:
+    """空串 / 非字符串 value 按缺失处理：绝不写入空字幕。"""
+
+    batch = _batch([1, 2, 3])
+    post = _post_returning_dict({"1": "中1", "2": "   ", "3": {"text": "被嵌套了"}})
+
+    with pytest.raises(TranslatePartialIdsError) as excinfo:
+        _call(batch, post)
+
+    # 2、3 都没有可用译文 -> missing；1 保留。
+    assert excinfo.value.missing == [2, 3]
+    assert excinfo.value.unexpected == []
+    assert excinfo.value.partial == {1: "中1"}
+
+
+def test_legacy_array_contract_still_accepted() -> None:
+    """d) 旧数组 [{id, text_zh}] 向后兼容：既有上游/回放数据不炸。"""
+
+    batch = _batch([7, 8])
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        items = [{"id": 7, "text_zh": "中7"}, {"id": "8", "text_zh": "中8"}]
+        return _content_http(json.dumps(items, ensure_ascii=False))
+
+    # 数组里 id 写成数字字符串也接受（统一 int() 归一），旧数据更宽容。
+    assert _call(batch, post) == {7: "中7", 8: "中8"}
+
+    def post_missing(url, **kwargs):  # type: ignore[no-untyped-def]
+        return _content_http(json.dumps([{"id": 7, "text_zh": "中7"}]))
+
+    with pytest.raises(TranslatePartialIdsError) as excinfo:
+        _call(batch, post_missing)
+    assert excinfo.value.missing == [8]
+    assert excinfo.value.partial == {7: "中7"}
+
+
+def test_llm_output_shape_that_is_neither_object_nor_array_is_retryable_parse_error() -> None:
+    """非对象非数组（例如纯字符串/数字）按 parse 类错误抛出，不静默成功。"""
+
+    batch = _batch([1])
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        return _content_http(json.dumps("这不是译文"))
+
+    with pytest.raises(ValueError) as excinfo:
+        _call(batch, post)
+    assert "neither a JSON object" in str(excinfo.value)
+    assert _error_class(excinfo.value) == "parse"
+    assert _is_retryable(excinfo.value) is True
+
+
+def test_real_api_dict_contract_short_batch_routes_through_c5_without_shift(
+    tmp_path: Path,
+) -> None:
+    """e) 真实路径：返回 key 连续但少一个 -> 只补缺失，且每条译文不后移一位。
+
+    这是 ADN-783-UC 的等价场景（84..107 共 24 条）：模型"拆行丢条"后只剩
+    84..106 共 23 个 key。断言两件事：
+    1. 少的那条被检出的缺失 id 精确为 107，第二轮**只**请求 [107]；
+    2. 最终 zh.srt 里每条 id 拿到的是**自己**的译文（id 84 是 zh-84，不是
+       下一条的 zh-85）——即旧契约下"整段后移一位"不可能再发生。
+    """
+
+    config_path = _write_config(
+        tmp_path / "config.ini",
+        translation_lines=["batch_size = 50", "retry = 3", "request_interval = 0"],
+    )
+    ids = list(range(84, 108))
+    ja = _make_srt_with_ids(tmp_path / "sample.ja.srt", ids)
+    output = tmp_path / "sample.zh.srt"
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"x")
+
+    requested: list[list[int]] = []
+    lock = threading.Lock()
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        asked = _requested_ids(kwargs)
+        with lock:
+            requested.append(asked)
+            first = len(requested) == 1
+        payload = {str(i): f"zh-{i}" for i in asked}
+        if first:
+            # 拆行丢条：114 个 key 变成 23 个，id 仍连续，但少了最后一条。
+            payload.pop("107")
+        return _content_http(json.dumps(payload, ensure_ascii=False))
+
+    run_translate(
+        ja,
+        output,
+        config_path=config_path,
+        timeout_sec=30,
+        input_video_path=video,
+        post_func=post,
+        defer_copy_back=True,
+    )
+
+    assert requested[0] == ids
+    assert requested[1] == [107]  # C.5：只补缺失，不整批重发
+    translations = _parse_zh_blocks(output.read_text(encoding="utf-8"))
+    # 条数不增减，逐条绑定自己的 id（无错位）。
+    assert sorted(translations) == ids
+    for item_id in ids:
+        assert translations[item_id] == f"zh-{item_id}"
+
+
+def test_real_api_dict_contract_one_extra_key_is_reported_not_silently_dropped(
+    tmp_path: Path,
+) -> None:
+    """e) 真实路径：多一个 key（拆行多出一条）-> unexpected 上报，仍按 id 落位。"""
+
+    config_path = _write_config(
+        tmp_path / "config.ini",
+        translation_lines=["batch_size = 50", "retry = 2", "request_interval = 0"],
+    )
+    ids = list(range(84, 108))
+    ja = _make_srt_with_ids(tmp_path / "sample.ja.srt", ids)
+    output = tmp_path / "sample.zh.srt"
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"x")
+
+    requested: list[list[int]] = []
+    lock = threading.Lock()
+
+    def post(url, **kwargs):  # type: ignore[no-untyped-def]
+        asked = _requested_ids(kwargs)
+        with lock:
+            requested.append(asked)
+            first = len(requested) == 1
+        payload = {str(i): f"zh-{i}" for i in asked}
+        if first:
+            # 模型把最后一条拆成两条：多出一个 108，同时丢了 84。
+            payload.pop("84")
+            payload["108"] = "多出来的一条"
+        return _content_http(json.dumps(payload, ensure_ascii=False))
+
+    run_translate(
+        ja,
+        output,
+        config_path=config_path,
+        timeout_sec=30,
+        input_video_path=video,
+        post_func=post,
+        defer_copy_back=True,
+    )
+
+    assert requested[0] == ids
+    assert requested[1] == [84]  # 只补真正缺失的 id
+    translations = _parse_zh_blocks(output.read_text(encoding="utf-8"))
+    assert sorted(translations) == ids
+    assert translations[84] == "zh-84"
+    assert translations[85] == "zh-85"
+    # 多出来的 108 绝不能被写进任何字幕行。
+    assert "多出来的一条" not in output.read_text(encoding="utf-8")

@@ -5,17 +5,21 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
 from queue import Queue
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 import logging
 import os
 import tempfile
 import time
 
 from whisper_stt_service.executor.common import (
+    DEFAULT_MAX_SEGMENT_SEC,
     ExecutorCancelledError,
     MissingAudioArtifactError,
     _emit_progress,
+    _log_timestamp_cleanup_summary,
     _probe_duration,
+    clean_segment_timeline,
+    coerce_max_segment_sec,
 )
 from whisper_stt_service.service.model_cache import (
     get_model_cache,
@@ -178,6 +182,20 @@ def _check_cancel(cancel_check: CancelCheck | None) -> None:
         raise ExecutorCancelledError(f"cancel_check_failed: {exc}") from exc
     if cancelled:
         raise ExecutorCancelledError("cancelled_by_upstream")
+
+
+def _iter_asr_segments(segments: Iterable[Any]) -> Iterator[tuple[str, float, float]]:
+    """把 faster-whisper 的段对象规整成 `(text, start, end)` 并丢掉空文本段。
+
+    空文本段不会产生字幕行，必须在时间戳清洗**之前**过滤掉：否则它会成为上一条的
+    lookahead 目标，把上一条的 end 收紧到一个根本不配音的起点上。
+    """
+
+    for seg in segments:
+        text = seg.text.strip()
+        if not text:
+            continue
+        yield text, float(seg.start), float(seg.end)
 
 
 def _segment_check_interval(progress_every: int, hard_limit: int = 50) -> int:
@@ -349,6 +367,11 @@ def run_stt(
         initial_prompt=initial_prompt,
         hotwords=hotwords,
     )
+    # 单段最长时长：`effective_config` 里没有该键时用默认 30s（非法值内部再归一化），
+    # 用于兜底 faster-whisper 在长静音处把段级 end 预测到几百秒的问题。
+    max_segment_sec = coerce_max_segment_sec(
+        effective_config.get("max_segment_sec", DEFAULT_MAX_SEGMENT_SEC)
+    )
     resolved_device = str(effective_config["resolved_device"])
     resolved_compute = str(effective_config["resolved_compute_type"])
     # SPEC D：模型实例走进程内缓存（同 key 只冷启动一次），并纳入 VAD/语言维度。
@@ -465,15 +488,24 @@ def run_stt(
                 segments, _ = model_runtime.transcribe(
                     str(input_video), **transcribe_kwargs
                 )
-            for seg_no, seg in enumerate(segments, start=1):
-                text = seg.text.strip()
-                if not text:
-                    continue
+            # 时间戳兜底（实测 A/D 影片：faster-whisper 在长静音处把段级 end 预测成
+            # 886.7s/489.9s）：写盘前统一清洗成"单调不重叠 + 单段 <= max_segment_sec"，
+            # **文本与条数不变**，只收紧时间（见 common.clean_segment_timeline）。
+            timestamp_stats: dict[str, Any] = {}
+            for seg_no, (text, start_sec, end_sec) in enumerate(
+                clean_segment_timeline(
+                    _iter_asr_segments(segments),
+                    max_segment_sec=max_segment_sec,
+                    stats=timestamp_stats,
+                ),
+                start=1,
+            ):
                 count += 1
-                last_end = float(seg.end)
+                last_end = end_sec
                 handle.write(f"{count}\n")
                 handle.write(
-                    f"{_format_timestamp(seg.start)} --> {_format_timestamp(seg.end)}\n"
+                    f"{_format_timestamp(start_sec)} --> "
+                    f"{_format_timestamp(end_sec)}\n"
                 )
                 handle.write(f"{text}\n\n")
 
@@ -497,6 +529,11 @@ def run_stt(
 
                 if time.perf_counter() - started > timeout_sec:
                     raise TimeoutError("stt_timeout")
+
+        # 清洗汇总：adjusted>0 说明确实存在超长/错乱段（WARNING 便于观测）。
+        _log_timestamp_cleanup_summary(
+            timestamp_stats, stage="stt", task_id=task_id
+        )
 
         # 发布前最后确认一次：取消/超时都不得把半成品变成正式产物。
         _check_cancel(cancel_check)

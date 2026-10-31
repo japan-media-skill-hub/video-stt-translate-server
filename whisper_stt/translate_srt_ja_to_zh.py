@@ -90,27 +90,26 @@ def _split_entries_by_time_window(
 
 
 def _build_translate_messages(batch: list[SrtEntry]) -> list[dict[str, str]]:
-    payload_items = [{"id": e.index, "text": e.text} for e in batch]
-    system_prompt = (
-        "You are a professional subtitle translator. Translate Japanese subtitles into natural, concise "
-        "Simplified Chinese. Use context and plot continuity to infer omitted subjects, keep naming and tone "
-        "consistent across this whole chunk, and avoid literal word-by-word translation. Intelligently clean "
-        "disfluencies and meaningless repetitions (such as long runs of interjections or stutters like "
-        "'ああああ', 'えええ', 'ううう'), compressing them into natural Chinese or removing them when they "
-        "carry no semantic meaning, while preserving the speaker's intent and emotion. Think carefully, but "
-        "output ONLY JSON."
+    """构造翻译消息，直接复用 service 侧同一份提示词实现。
+
+    对齐契约（修复"整段后移一位"）：脚本模式与服务模式必须使用**同一个**输出契约
+    （以 id 为 key 的 JSON 对象 {"<id>": "<中文>"}、条数一致、禁止合并/拆分/新增/
+    丢弃/改号），否则脚本翻译出来的字幕仍会整体错位一格。这里不再本地复刻一份
+    prompt（上一版正是把 `{"id", "text_zh"}` 数组契约写死在这里，与服务端漂移），
+    改为委托 `whisper_stt_service.executor.common._build_translate_messages()`：
+    契约只在一处定义，脚本只能跟随。
+
+    延迟导入：与 `extract_json_object()` 同样的做法，脚本仍可独立放置，
+    只有真正构造请求时才依赖仓库内的 service 包。
+    本函数的入参是脚本自己的 `SrtEntry`，与 service 的 dataclass 不同，
+    但构造时只读取 `index`/`text` 两个属性，行为完全一致。
+    """
+
+    from whisper_stt_service.executor.common import (
+        _build_translate_messages as _service_build_translate_messages,
     )
-    user_prompt = (
-        "Translate the following JSON array from Japanese to Simplified Chinese subtitles. "
-        "Return ONLY a JSON array with objects in the form: "
-        '{"id": <same id>, "text_zh": "..."}. Keep the same ids and same item count. '
-        "For repetitive filler words, perform intelligent denoising and output fluent subtitles.\n\n"
-        f"{json.dumps(payload_items, ensure_ascii=False)}"
-    )
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+
+    return _service_build_translate_messages(batch)  # type: ignore[arg-type]
 
 
 def extract_json_object(text: str) -> Any:
@@ -126,7 +125,12 @@ def extract_json_object(text: str) -> Any:
 
     from whisper_stt_service.executor.common import _extract_json_object
 
-    return _extract_json_object(text, required_keys=("id", "text_zh"))
+    # accept_id_keyed=True：新契约是"以 id 为 key 的对象"（{"84": "..."}），
+    # 其 key 不是 id/text_zh 字段名；不加这个判定，若上游先吐一个元数据对象
+    # （例如 {"note": "ok"}）就会把它当载荷返回。旧数组契约仍然命中 required_keys。
+    return _extract_json_object(
+        text, required_keys=("id", "text_zh"), accept_id_keyed=True
+    )
 
 
 def _format_hms(seconds: float) -> str:
@@ -169,6 +173,21 @@ def _call_api(
     batch: list[SrtEntry],
     timeout: int,
 ) -> dict[int, str]:
+    """调用一次上游 API，返回 id -> 中文映射；id 集合不一致时抛部分缺失异常。
+
+    解析层与 service 完全同一份实现（`_parse_translate_mapping`）：
+    - 兼容新契约"以 id 为 key 的 JSON 对象"与旧契约"数组 [{id, text_zh}]"；
+    - missing / unexpected 由它算出，缺失时抛 `TranslatePartialIdsError`（含
+      `partial` 已得映射），由 `translate_batch_with_retry` 只补缺失；
+    - 空串/非字符串 value 按缺失处理，绝不写入空字幕。
+    该异常是 `ValueError` 的子类，历史上捕获 `ValueError` 的调用方语义不变。
+    """
+
+    from whisper_stt_service.executor.translate import (
+        TranslatePartialIdsError,
+        _parse_translate_mapping,
+    )
+
     messages = _build_translate_messages(batch)
 
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -186,22 +205,13 @@ def _call_api(
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
     parsed = extract_json_object(content)
-    if not isinstance(parsed, list):
-        raise ValueError("model output is not a JSON array")
-
-    mapping: dict[int, str] = {}
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        item_id = item.get("id")
-        text_zh = item.get("text_zh")
-        if isinstance(item_id, int) and isinstance(text_zh, str) and text_zh.strip():
-            mapping[item_id] = text_zh.strip()
 
     expected = {e.index for e in batch}
-    if set(mapping.keys()) != expected:
-        missing = sorted(expected - set(mapping.keys()))
-        raise ValueError(f"batch translation ids mismatch, missing={missing[:10]}")
+    mapping, missing, unexpected = _parse_translate_mapping(parsed, expected)
+    if missing or unexpected:
+        raise TranslatePartialIdsError(
+            missing=missing, unexpected=unexpected, partial=mapping
+        )
     return mapping
 
 
@@ -216,20 +226,78 @@ def translate_batch_with_retry(
     timeout: int,
     retry: int,
 ) -> BatchResult:
+    """批次内重试；部分 id 缺失按 C.5 语义降级（与服务端一致）。
+
+    C.5 语义：模型只返回部分 id 时，先**收下已得译文**，之后的重试只请求仍然缺失
+    的 id（不整批重发，避免重复计费、也避免已得译文被丢弃）。重试耗尽仍缺的条目
+    由 `dump_srt()` 保留日文原文，绝不丢行。
+
+    失败语义不变：连接/超时/5xx/解析类错误（非 id 不匹配）耗尽重试后照旧抛
+    `RuntimeError`，整批失败、由上层 CLI 报错，不做"静默降级"。
+    """
+
+    from whisper_stt_service.executor.translate import TranslatePartialIdsError
+
     last_err: Exception | None = None
+    # 待翻译条目：只有 id 缺失时才收窄（与 `run_translate` 的 pending_entries 同义）。
+    pending = list(batch)
+    accepted: dict[int, str] = {}
+    # 仅"最后一次失败是 id 不匹配"才允许降级保留原文（否则必须整批失败）。
+    partial_only = False
+    attempts_used = 0
     for attempt in range(1, retry + 1):
+        if not pending:
+            break
+        attempts_used = attempt
         try:
-            mapped = _call_api(post_func, base_url, api_key, model, batch, timeout)
-            return BatchResult(mapping=mapped, attempts_used=attempt)
-        except Exception as exc:  # noqa: BLE001
+            mapped = _call_api(post_func, base_url, api_key, model, pending, timeout)
+        except TranslatePartialIdsError as exc:
+            # C.5 真实路径：收下已返回的子集，下一次只请求仍缺的 id。
             last_err = exc
+            partial_only = True
+            if exc.partial:
+                accepted.update(exc.partial)
+                pending = [e for e in pending if e.index not in accepted]
             print(
                 f"RETRY batch={batch_no}/{total_batches} attempt={attempt}/{retry} "
-                f"pending={len(batch)} error_type={type(exc).__name__}",
+                f"pending={len(pending)} error_type={type(exc).__name__}",
+                flush=True,
+            )
+            if not pending:
+                break
+            time.sleep(min(2.0 * attempt, 8.0))
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            partial_only = False
+            print(
+                f"RETRY batch={batch_no}/{total_batches} attempt={attempt}/{retry} "
+                f"pending={len(pending)} error_type={type(exc).__name__}",
                 flush=True,
             )
             time.sleep(min(2.0 * attempt, 8.0))
-    raise RuntimeError(f"batch={batch_no}/{total_batches} failed: {last_err}")
+            continue
+        accepted.update(mapped)
+        pending = [e for e in pending if e.index not in accepted]
+        if not pending:
+            break
+        # 理论上 `_call_api` 不会"无异常但缺 id"，出现也按部分缺失继续补。
+        last_err = TranslatePartialIdsError(
+            missing=[e.index for e in pending], unexpected=[]
+        )
+        partial_only = True
+
+    if pending and not partial_only:
+        # 整批失败（连接/超时/5xx/解析）：交给上层失败，不静默降级。
+        raise RuntimeError(f"batch={batch_no}/{total_batches} failed: {last_err}")
+    if pending:
+        # 仅"部分 id 缺失"耗尽重试：保留已得译文，缺失条目由 dump_srt 保留日文原文。
+        print(
+            f"PARTIAL batch={batch_no}/{total_batches} "
+            f"missing={[e.index for e in pending][:10]} fallback=keep_source_text",
+            flush=True,
+        )
+    return BatchResult(mapping=accepted, attempts_used=attempts_used)
 
 
 def _parse_args() -> argparse.Namespace:

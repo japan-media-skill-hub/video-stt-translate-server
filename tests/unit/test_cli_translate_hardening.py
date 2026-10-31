@@ -371,3 +371,281 @@ def test_cli_legacy_engine_still_selectable(cli, tmp_path: Path, monkeypatch) ->
     )
 
     assert "zh-1" in args.output.read_text(encoding="utf-8")
+
+# ---------------- 对齐契约：脚本模式与服务模式同一份"以 id 为 key 的对象"契约
+#
+# (A) 真实故障：模型把一条日文拆成两条中文、又丢掉最后一条，但返回的 id 仍连续
+# （84..107），旧数组契约只校验"id 集合相等"就放行，整段译文后移一位。
+# 脚本模式（包括 --engine legacy 的排障路径）必须与服务端同一契约，否则用脚本
+# 翻译出来的字幕照样错位。下面用 fake HTTP 走真实 main/legacy 路径断言三条：
+# 新 dict 格式可用、少 key 只补缺失、多 key 不落盘。
+
+
+def _dict_response(mapping: dict[str, str]) -> FakeResponse:
+    """构造"模型返回 {id: 译文} 对象"的 200 响应（新契约）。"""
+
+    content = json.dumps(mapping, ensure_ascii=False)
+    return FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+
+
+def _requested_ids(kwargs: dict) -> list[int]:
+    """从请求体反解本次实际请求的字幕 id（验证"只补缺失"）。"""
+
+    payload = kwargs["json"]["messages"][1]["content"]
+    return [item["id"] for item in json.loads(payload.split("\n\n", 1)[1])]
+
+
+def _zh_blocks(path: Path) -> list[str]:
+    """把 zh.srt 切成非空块，便于逐条断言"译文落在自己的 id 上"。"""
+
+    return [b for b in path.read_text(encoding="utf-8").split("\n\n") if b.strip()]
+
+
+def test_cli_main_accepts_id_keyed_dict_contract(
+    cli, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """新 dict 格式经真实 main（unified 引擎）可用，且 prompt 已是新契约。"""
+
+    cfg = _write_config(tmp_path)
+    ja = _write_srt(tmp_path, 2)
+    output = tmp_path / "sample.zh.srt"
+    prompts: list[str] = []
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return _dict_response({"1": "zh-1", "2": "zh-2"})
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "translate_srt_ja_to_zh.py",
+            "--config",
+            str(cfg),
+            "--input",
+            str(ja),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert cli.main() == 0
+    assert "engine=unified" in capsys.readouterr().out
+    blocks = _zh_blocks(output)
+    assert len(blocks) == 2
+    assert "zh-1" in blocks[0] and "zh-2" in blocks[1]
+    # 脚本提示词必须与服务端同一契约（id 为 key、条数一致、禁止合并/拆分）。
+    assert prompts and '"<id>"' in prompts[0]
+    assert "no more, no fewer" in prompts[0]
+    assert "never merge" in prompts[0] and "never split" in prompts[0]
+
+
+def test_cli_main_dict_missing_key_refetches_only_missing(
+    cli, tmp_path: Path, monkeypatch
+) -> None:
+    """少 key（拆行丢条）：只补缺失 id，且每条译文不后移一位。"""
+
+    cfg = _write_config(tmp_path, overrides={"batch_size": "10", "retry": "3"})
+    ja = _write_srt(tmp_path, 3)
+    output = tmp_path / "sample.zh.srt"
+    requested: list[list[int]] = []
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        ids = _requested_ids(kwargs)
+        requested.append(ids)
+        mapping = {str(i): f"zh-{i}" for i in ids}
+        if len(requested) == 1:
+            mapping.pop("3")  # 拆行丢条：首轮少一个 key
+        return _dict_response(mapping)
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "translate_srt_ja_to_zh.py",
+            "--config",
+            str(cfg),
+            "--input",
+            str(ja),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert cli.main() == 0
+    assert requested == [[1, 2, 3], [3]]  # C.5：只补缺失，不整批重发
+    blocks = _zh_blocks(output)
+    assert len(blocks) == 3
+    for item_id, block in zip((1, 2, 3), blocks):
+        assert f"zh-{item_id}" in block  # 逐条绑定自己的 id，无错位
+
+
+def test_cli_main_dict_extra_key_is_not_written(
+    cli, tmp_path: Path, monkeypatch
+) -> None:
+    """多 key（拆行多出一条）：多出来的译文绝不落盘，正常条目仍写入。"""
+
+    cfg = _write_config(tmp_path, overrides={"batch_size": "10", "retry": "2"})
+    ja = _write_srt(tmp_path, 2)
+    output = tmp_path / "sample.zh.srt"
+    calls = {"n": 0}
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return _dict_response({"1": "zh-1", "2": "zh-2", "99": "多出来的一条"})
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "translate_srt_ja_to_zh.py",
+            "--config",
+            str(cfg),
+            "--input",
+            str(ja),
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert cli.main() == 0
+    text = output.read_text(encoding="utf-8")
+    assert "zh-1" in text and "zh-2" in text
+    assert "多出来的一条" not in text  # 本批之外的 id 不得写入任何字幕行
+    assert calls["n"] == 1  # 已得子集收下后 pending 为空，不再补请求
+
+
+def test_legacy_engine_accepts_dict_contract(cli, tmp_path: Path, monkeypatch) -> None:
+    """--engine legacy 的排障路径同样支持新 dict 契约（提示词同源）。"""
+
+    cfg = _write_config(tmp_path)
+    ja = _write_srt(tmp_path, 2)
+    args = _args(cli, tmp_path, cfg, ja, engine="legacy")
+    prompts: list[str] = []
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        prompts.append(kwargs["json"]["messages"][1]["content"])
+        return _dict_response({"1": "zh-1", "2": "zh-2"})
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+
+    cli._run_legacy_engine(
+        args, repo_root=tmp_path, config_path=cfg, config=cli._load_config(cfg)
+    )
+
+    blocks = _zh_blocks(args.output)
+    assert len(blocks) == 2
+    assert "zh-1" in blocks[0] and "zh-2" in blocks[1]
+    assert prompts and '"<id>"' in prompts[0]
+
+
+def test_legacy_engine_dict_missing_key_retries_only_missing(
+    cli, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """legacy 引擎的 C.5：少 key 时只补缺失 id，已得译文与条数都不丢。"""
+
+    cfg = _write_config(tmp_path, overrides={"retry": "3"})
+    ja = _write_srt(tmp_path, 3)
+    args = _args(cli, tmp_path, cfg, ja, engine="legacy")
+    requested: list[list[int]] = []
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        ids = _requested_ids(kwargs)
+        requested.append(ids)
+        mapping = {str(i): f"zh-{i}" for i in ids}
+        if len(requested) == 1:
+            mapping.pop("3")  # 首轮少一个 key
+        return _dict_response(mapping)
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+
+    cli._run_legacy_engine(
+        args, repo_root=tmp_path, config_path=cfg, config=cli._load_config(cfg)
+    )
+
+    assert requested == [[1, 2, 3], [3]]
+    blocks = _zh_blocks(args.output)
+    assert len(blocks) == 3
+    for item_id, block in zip((1, 2, 3), blocks):
+        assert f"zh-{item_id}" in block
+    assert "keep_source_text" not in capsys.readouterr().out  # 补齐了，无需保留原文
+
+
+def test_legacy_engine_dict_extra_key_is_not_written(
+    cli, tmp_path: Path, monkeypatch
+) -> None:
+    """legacy 引擎：多出来的 id 被上报，且绝不写入字幕。"""
+
+    cfg = _write_config(tmp_path, overrides={"retry": "2"})
+    ja = _write_srt(tmp_path, 2)
+    args = _args(cli, tmp_path, cfg, ja, engine="legacy")
+    calls = {"n": 0}
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        return _dict_response({"1": "zh-1", "2": "zh-2", "99": "多出来的一条"})
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+
+    cli._run_legacy_engine(
+        args, repo_root=tmp_path, config_path=cfg, config=cli._load_config(cfg)
+    )
+
+    text = args.output.read_text(encoding="utf-8")
+    assert "zh-1" in text and "zh-2" in text
+    assert "多出来的一条" not in text
+    assert calls["n"] == 1
+
+
+def test_legacy_engine_non_id_failure_still_fails_loudly(
+    cli, tmp_path: Path, monkeypatch
+) -> None:
+    """legacy 引擎的失败语义未变：连接类错误耗尽重试即 RuntimeError，不静默降级。"""
+
+    cfg = _write_config(tmp_path, overrides={"retry": "2"})
+    ja = _write_srt(tmp_path, 2)
+    args = _args(cli, tmp_path, cfg, ja, engine="legacy")
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        raise requests.ConnectionError("boom")
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        cli._run_legacy_engine(
+            args, repo_root=tmp_path, config_path=cfg, config=cli._load_config(cfg)
+        )
+    assert not args.output.exists()  # 整批失败不落半成品
+
+
+def test_legacy_engine_partial_exhausted_keeps_source_text(
+    cli, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """legacy 引擎重试耗尽仍缺 id：保留日文原文，不丢行、不静默丢批。"""
+
+    cfg = _write_config(tmp_path, overrides={"retry": "2"})
+    ja = _write_srt(tmp_path, 2)
+    args = _args(cli, tmp_path, cfg, ja, engine="legacy")
+
+    def handler(url, **kwargs):  # type: ignore[no-untyped-def]
+        return _dict_response({"1": "zh-1"})  # 永远缺 id2
+
+    _install_fake_http(cli, monkeypatch, handler)
+    monkeypatch.setattr(cli.time, "sleep", lambda *_args, **_kwargs: None)
+
+    cli._run_legacy_engine(
+        args, repo_root=tmp_path, config_path=cfg, config=cli._load_config(cfg)
+    )
+
+    blocks = _zh_blocks(args.output)
+    assert len(blocks) == 2  # 条数不丢
+    assert "zh-1" in blocks[0]
+    assert "源2" in blocks[1]  # 缺失 id 保留日文原文
+    assert "keep_source_text" in capsys.readouterr().out
