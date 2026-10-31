@@ -1814,6 +1814,8 @@ class WorkerRuntime:
             "input_ja_srt": self._resolve_translate_input(ctx),
             "output_zh_srt": output_path,
             "config_path": self.config_path,
+            # 任务级 deadline 只取 tasks.timeout_sec（来自 [timeouts] translate_timeout_sec
+            # 或显式任务覆盖）；单批 HTTP 超时通过 job_config["timeout"] 下发，二者不可混用。
             "timeout_sec": int(task_cfg.get("timeout_sec", ctx.timeout_sec)),
             "input_video_path": Path(ctx.video_path),
             "copy_back": str(

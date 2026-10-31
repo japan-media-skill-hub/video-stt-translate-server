@@ -444,6 +444,15 @@ class JobRepository:
         base.update(dict(self.stage_effective_defaults.get(stage, {})))
         if overrides:
             base.update(dict(overrides))
+        # P1 修复：任务级 timeout_sec 只能来自 stage_timeouts（[timeouts] 段）或
+        # 显式任务级覆盖；stage 生效默认值里的 timeout_sec 属于历史污染（HTTP 超时
+        # 曾被映射到此键），这里显式纠正，保证 tasks.timeout_sec 与 effective_config
+        # 一致，不会再让单批 HTTP 超时决定任务总 deadline。
+        base["timeout_sec"] = int(
+            (overrides or {}).get(
+                "timeout_sec", self.stage_timeouts.get(stage, 3600)
+            )
+        )
         return base
 
     def _loads_or_empty(self, raw: str | None) -> dict:

@@ -261,6 +261,9 @@ def run_translate(
     批次以受限线程池并发执行（并发上限 = `parallel`，默认 2），结果按批次
     序号与原文顺序聚合写回；每批成功后立即原子落检查点，重跑只补未完成批次。
 
+    `timeout_sec` 是本任务的**总 deadline**（runtime 下发 tasks.timeout_sec，来源是
+    `[timeouts] translate_timeout_sec` 或显式的任务级 job_config 覆盖）；单批 HTTP
+    超时另走 `job_config["timeout"]` / `[translation] timeout`，两者不得混用。
     `job_config` 为 task 的 `job_config.translate` 段（优先级最高）；
     `cancel_check` 供 runtime 在失租/停机时中止翻译：返回 True 后不再派发新批次、
     不再发布进度或写入产物，并抛出 `TranslateCancelledError` 交由上层放弃结果写回；
@@ -297,9 +300,12 @@ def run_translate(
 
     # 真正生效的配置全部来自 settings（job_config > [translation] > 默认值）。
     effective_retry = settings.retry
-    effective_timeout_sec = settings.timeout_sec
     request_interval = settings.request_interval
     parallel = settings.parallel
+    # P1 修复：任务级 deadline 只取调用方传入的 timeout_sec（任务超时）；settings
+    # 的 timeout_sec 是单批 HTTP 超时，若用它做 deadline，长片翻译会在 HTTP 超时
+    # 点被误判为 translate_timeout。
+    task_timeout_sec = max(int(timeout_sec), 1)
 
     source_text = input_ja_srt.read_text(encoding="utf-8")
     entries = _parse_srt(source_text)
@@ -358,7 +364,7 @@ def run_translate(
         output_zh_srt=output_zh_srt,
         source_sha256=source_sha256,
         job_id=(job_id or task_id or ""),
-        deadline_at=time.perf_counter() + effective_timeout_sec,
+        deadline_at=time.perf_counter() + task_timeout_sec,
         request_interval=request_interval,
         parallel=parallel,
         progress_queue=progress_queue,

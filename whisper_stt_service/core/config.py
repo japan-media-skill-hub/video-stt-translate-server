@@ -169,14 +169,21 @@ class TranslationSettings:
     progress_ttl_sec: int = 604800
 
     def as_job_config(self) -> dict[str, object]:
-        """转成 run_translate 的 job_config 形态（作为 stage 生效默认值）。"""
+        """转成 run_translate 的 job_config 形态（作为 stage 生效默认值）。
+
+        P1 修复：这里只能下发 HTTP 语义的 `timeout`。`timeout_sec` 在本服务是
+        **任务级**超时（只能来自 `[timeouts]` 或显式的任务级 job_config 覆盖），
+        若把单批 HTTP 超时写成 `timeout_sec`，enqueue 会把它固化成
+        tasks.timeout_sec，覆盖 `[timeouts] translate_timeout_sec`，让长片翻译
+        在 HTTP 超时点（默认 240s）被 translate_timeout 提前判死。
+        """
 
         return {
             "parallel": self.parallel,
             "batch_size": self.batch_size,
             "max_chars": self.max_chars,
             "chunk_minutes": self.chunk_minutes,
-            "timeout_sec": self.timeout_sec,
+            "timeout": self.timeout_sec,
             "retry": self.retry,
             "request_interval": self.request_interval,
             "disable_proxy": self.disable_proxy,

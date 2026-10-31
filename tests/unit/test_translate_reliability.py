@@ -261,6 +261,85 @@ def test_resolve_translate_settings_legacy_kwargs_still_override(tmp_path: Path)
     assert resolved.copy_back == "/tmp/x"
 
 
+def test_resolve_translate_settings_http_timeout_ignores_task_timeout_sec(
+    tmp_path: Path,
+) -> None:
+    """P1 回归：job_config["timeout"] 才是 HTTP 超时，任务级 timeout_sec 不得污染它。"""
+
+    config_path = _write_config(
+        tmp_path / "config.ini", translation_lines=["timeout = 77"]
+    )
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path, encoding="utf-8")
+
+    # runtime 会把整份 effective_config（含任务级 timeout_sec=7200）当 job_config 下发；
+    # HTTP 超时只能取 timeout 键。
+    resolved = resolve_translate_settings(cfg, {"timeout": 240, "timeout_sec": 7200})
+    assert resolved.timeout_sec == 240
+
+    # 缺 timeout 键时回退 [translation] timeout（配置键名是 timeout，不是 timeout_sec），
+    # 绝不读任务级的 job_config["timeout_sec"]。
+    fallback = resolve_translate_settings(cfg, {"timeout_sec": 7200})
+    assert fallback.timeout_sec == 77
+
+    # [translation] 缺 timeout 时用代码默认值；任务级 timeout_sec 同样不参与。
+    default_cfg = configparser.ConfigParser()
+    default_cfg.read(
+        _write_config(tmp_path / "default.ini", translation_lines=["retry = 3"]),
+        encoding="utf-8",
+    )
+    assert (
+        resolve_translate_settings(default_cfg, {"timeout_sec": 7200}).timeout_sec
+        == 240
+    )
+
+    # 旧关键字 timeout_sec 仍作为 HTTP 超时兼容回退（不改变旧库调用方语义）。
+    legacy = resolve_translate_settings(cfg, {"timeout_sec": 7200}, timeout_sec=30)
+    assert legacy.timeout_sec == 30
+
+
+def test_translate_http_timeout_does_not_kill_long_running_task(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """P1 回归：单批 HTTP 超时（1s）不得变成任务总 deadline，长任务不能被提前判死。"""
+
+    config_path = _write_config(
+        tmp_path / "config.ini",
+        translation_lines=[
+            "chunk_minutes = 1",
+            "batch_size = 1",
+            "parallel = 1",
+            "retry = 1",
+            "request_interval = 0",
+            "timeout = 1",
+        ],
+    )
+    ja = _make_srt(tmp_path / "sample.ja.srt", 2)
+    video = tmp_path / "sample.mp4"
+    video.write_bytes(b"x")
+
+    def slow_call(post, **kwargs):  # type: ignore[no-untyped-def]
+        # 每批耗时都超过 HTTP 超时（1s），但远小于任务 deadline（10s）。
+        time.sleep(1.2)
+        return {e.index: f"zh-{e.index}" for e in kwargs["batch"]}
+
+    monkeypatch.setattr(
+        "whisper_stt_service.executor.translate._call_translate_api", slow_call
+    )
+
+    # job_config["timeout"]=1 只影响 HTTP 请求；任务 deadline 由 timeout_sec=10 决定。
+    run_translate(
+        ja,
+        tmp_path / "sample.zh.srt",
+        config_path=config_path,
+        timeout_sec=10,
+        input_video_path=video,
+        job_config={"timeout": 1},
+    )
+
+    assert (tmp_path / "sample.zh.srt").is_file()
+
+
 def test_resolve_translate_settings_parallel_defaults_to_two(tmp_path: Path) -> None:
     """缺省配置下并发上限为 2（D2）。"""
 

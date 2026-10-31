@@ -556,6 +556,12 @@ def resolve_translate_settings(
     job_config 的同级覆盖，保证向后兼容。新增键（`max_chars`、
     `checkpoint_enabled`、`strict_ids`、`progress_ttl_sec` 等）缺失时取其默认值，
     因此旧配置可直接加载。
+
+    HTTP 单批超时（`timeout_sec` 字段）的来源固定为：
+    `job_config["timeout"]` > 旧关键字 `timeout_sec` > `[translation] timeout`
+    > 代码默认值。`job_config["timeout_sec"]` 是**任务级**超时（runtime 用它做
+    总 deadline，来源是 `[timeouts]` 或显式任务覆盖），绝不能再被解读成 HTTP
+    超时，否则任务超时与单批超时会互相污染（P1 回归）。
     """
 
     overrides: dict[str, Any] = dict(job_config or {})
@@ -563,8 +569,11 @@ def resolve_translate_settings(
         overrides["chunk_minutes"] = chunk_minutes
     if retry is not None:
         overrides["retry"] = retry
-    if timeout_sec is not None:
-        overrides["timeout_sec"] = timeout_sec
+    # 旧关键字 timeout_sec 只作为 HTTP 超时的兼容回退（见下方 http_timeout_override）；
+    # 不写入 overrides，避免它被当成任务级键继续向下游扩散。
+    http_timeout_override = overrides.get("timeout")
+    if http_timeout_override is None:
+        http_timeout_override = timeout_sec
     if copy_back is not None and str(copy_back).strip():
         overrides["copy_back"] = copy_back
     if progress_ttl_sec is not None:
@@ -598,6 +607,13 @@ def resolve_translate_settings(
 
         # 逐级回退：job_config/关键字覆盖 > [translation] > 代码默认值。
         value: Any = overrides.get(key)
+        if key == "timeout_sec":
+            # HTTP 超时专用：job_config["timeout_sec"] 属于任务级 deadline，
+            # 这里显式忽略它，只认 timeout 键/旧关键字；配置段里对应的键名是
+            # `[translation] timeout`（不是 timeout_sec）。
+            value = http_timeout_override
+            if value is None:
+                value = _read_translation_section(config, "timeout", kind="int")
         if value is None:
             value = _read_translation_section(config, key, kind=kind)
         if value is None:

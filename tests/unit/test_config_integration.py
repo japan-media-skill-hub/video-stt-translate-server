@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import configparser
+import json
 import os
 import textwrap
 from pathlib import Path
@@ -47,6 +49,9 @@ def _write_config(tmp_path: Path, *, model_path: Path | None = None, **overrides
         "translation.max_chars": "9000",
         "translation.checkpoint_enabled": "true",
         "translation.strict_ids": "false",
+        # P1 回归：HTTP 单批超时与任务级超时是两个独立配置项，默认值保持不变。
+        "translation.timeout": "240",
+        "timeouts.translate_timeout_sec": "60",
         "runtime.model_cache_size": "3",
         "runtime.model_parallelism": "2",
     }
@@ -76,7 +81,7 @@ def _write_config(tmp_path: Path, *, model_path: Path | None = None, **overrides
         max_chars = {values["translation.max_chars"]}
         chunk_minutes = 20
         retry = 10
-        timeout = 240
+        timeout = {values["translation.timeout"]}
         checkpoint_enabled = {values["translation.checkpoint_enabled"]}
         strict_ids = {values["translation.strict_ids"]}
 
@@ -90,7 +95,7 @@ def _write_config(tmp_path: Path, *, model_path: Path | None = None, **overrides
         extract_timeout_sec = 60
         stt_timeout_sec = 60
         stt_whisperx_timeout_sec = 60
-        translate_timeout_sec = 60
+        translate_timeout_sec = {values["timeouts.translate_timeout_sec"]}
         lease_timeout_sec = 60
 
         [retry]
@@ -373,7 +378,83 @@ def test_build_app_applies_translation_defaults_to_stage_config(monkeypatch, tmp
     assert translate_defaults["parallel"] == 3
     assert translate_defaults["max_chars"] == 9000
     assert translate_defaults["checkpoint_enabled"] is True
-    assert translate_defaults["timeout_sec"] == 240
+    # P1 修复：stage 默认值只能带 HTTP 超时（timeout），不得写任务级 timeout_sec。
+    assert translate_defaults["timeout"] == 240
+    assert "timeout_sec" not in translate_defaults
+
+
+def _translate_task_detail(app, job_id: str) -> dict:
+    """读取 translate task 的落库明细（DB 列 timeout_sec 与 task_config）。"""
+
+    with app.state.repo.db.connect() as conn:
+        row = conn.execute(
+            "SELECT timeout_sec, task_config_json FROM tasks "
+            "WHERE job_id=? AND stage='translate'",
+            (job_id,),
+        ).fetchone()
+    assert row is not None
+    return {
+        "timeout_sec": int(row["timeout_sec"]),
+        "task_config": json.loads(row["task_config_json"]),
+    }
+
+
+def _resolve_http_timeout(effective_config: dict) -> int:
+    """按 executor 真实解析路径（config.ini + job_config）取 HTTP 单批超时。"""
+
+    from whisper_stt_service.executor.common import resolve_translate_settings
+
+    cfg = configparser.ConfigParser()
+    cfg.read(os.environ["WHISPER_STT_CONFIG"], encoding="utf-8")
+    return resolve_translate_settings(cfg, effective_config).timeout_sec
+
+
+def test_translate_task_timeout_comes_from_timeouts_not_http_timeout(
+    monkeypatch, tmp_path
+) -> None:
+    """P1 回归：HTTP 超时 240s 不得变成 translate 任务级 timeout_sec（应为 7200）。"""
+
+    app = _build_app(
+        monkeypatch,
+        tmp_path,
+        **{"translation.timeout": "240", "timeouts.translate_timeout_sec": "7200"},
+    )
+    created = app.state.repo.enqueue(str(tmp_path / "p1-regression.mp4"), "ja")
+    assert created.accepted is True
+
+    task = _translate_task_detail(app, created.job_id)
+    effective = task["task_config"]["effective_config"]
+    # 任务级超时只来自 [timeouts] translate_timeout_sec。
+    assert task["timeout_sec"] == 7200
+    assert effective["timeout_sec"] == 7200
+    # HTTP 单批超时仍来自 [translation] timeout，且 executor 真实解析路径读得到。
+    assert effective["timeout"] == 240
+    assert _resolve_http_timeout(effective) == 240
+    # 任务级与 HTTP 级必须分离：任务不会在 240s 的 HTTP 超时点被提前判死。
+    assert task["timeout_sec"] > effective["timeout"]
+
+
+def test_translate_job_config_timeout_sec_still_wins(monkeypatch, tmp_path) -> None:
+    """显式 job_config.translate.timeout_sec 仍作为任务级覆盖并优先。"""
+
+    app = _build_app(
+        monkeypatch,
+        tmp_path,
+        **{"translation.timeout": "240", "timeouts.translate_timeout_sec": "7200"},
+    )
+    created = app.state.repo.enqueue(
+        str(tmp_path / "p1-override.mp4"),
+        "ja",
+        job_config={"translate": {"timeout_sec": 1800}},
+    )
+    assert created.accepted is True
+
+    task = _translate_task_detail(app, created.job_id)
+    effective = task["task_config"]["effective_config"]
+    assert task["timeout_sec"] == 1800
+    assert effective["timeout_sec"] == 1800
+    # 任务级覆盖不得反过来改写 HTTP 超时。
+    assert _resolve_http_timeout(effective) == 240
 
 
 def test_build_app_metrics_disabled_is_404(monkeypatch, tmp_path) -> None:

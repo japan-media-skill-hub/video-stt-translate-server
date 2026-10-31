@@ -278,6 +278,52 @@ def test_repo_copy_back_does_not_require_existing_directory(tmp_path: Path) -> N
     assert created.accepted is True
 
 
+# --------------------------------------------------------- 任务级超时来源
+
+
+def _task_timeout_sec(repo: JobRepository, job_id: str, stage: str = "translate") -> int:
+    """直接读 tasks.timeout_sec（get_job_detail 不暴露该列）。"""
+
+    with repo.db.connect() as conn:
+        row = conn.execute(
+            "SELECT timeout_sec FROM tasks WHERE job_id=? AND stage=?",
+            (job_id, stage),
+        ).fetchone()
+    assert row is not None
+    return int(row["timeout_sec"])
+
+
+def test_enqueue_task_timeout_ignores_stage_default_timeout_sec(tmp_path: Path) -> None:
+    """P1 回归：stage 默认值里的 timeout_sec 不得覆盖 [timeouts] 的任务级超时。"""
+
+    repo = _repo(
+        tmp_path,
+        stage_timeouts={"translate": 7200},
+        # 模拟历史污染：stage 默认值同时带 HTTP 超时与任务级 timeout_sec。
+        stage_effective_defaults={"translate": {"timeout": 240, "timeout_sec": 240}},
+    )
+    created = repo.enqueue("/tmp/p1-timeout.mp4", "ja")
+    task = _tasks(repo, created.job_id)["translate"]
+    effective = task["task_config"]["effective_config"]
+    assert effective["timeout_sec"] == 7200
+    assert effective["timeout"] == 240
+    assert _task_timeout_sec(repo, created.job_id) == 7200
+
+
+def test_enqueue_task_timeout_explicit_override_still_wins(tmp_path: Path) -> None:
+    """显式 job_config.translate.timeout_sec 仍是任务级最高优先级。"""
+
+    repo = _repo(tmp_path, stage_timeouts={"translate": 7200})
+    created = repo.enqueue(
+        "/tmp/p1-timeout-override.mp4",
+        "ja",
+        job_config={"translate": {"timeout_sec": 1800}},
+    )
+    task = _tasks(repo, created.job_id)["translate"]
+    assert task["task_config"]["effective_config"]["timeout_sec"] == 1800
+    assert _task_timeout_sec(repo, created.job_id) == 1800
+
+
 # --------------------------------------------------------- 入队安全校验
 
 
