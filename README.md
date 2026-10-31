@@ -18,7 +18,8 @@ A local movie translation pipeline that combines `ffmpeg`, `Whisper/WhisperX`, a
 > The seven P1s have been implemented and independently re-verified by Sol with the original real-SQLite/file
 > counterexamples and the cross-FS copyback/symlink-swap tests. The annotated `v0.5.0` tag is pushed and points
 > to the final documentation commit on `main` (`git describe --tags --exact-match main`). Real
-> 2-hour/GPU acceptance and provider-side token rotation remain unverified. See [Verification status](#verification-status).
+> Real 2-hour media acceptance is now verified on 3 complete movies (see [Verification status](#verification-status));
+> GPU memory peaks and provider-side token rotation remain unverified.
 
 ## Project purpose
 
@@ -410,10 +411,10 @@ installed. No paid LLM request was sent during this verification pass.
 | Lock graph equivalence | passed locally | child 144 and root 143 packages; versions/sdist+wheel hashes/dependency graph unchanged (only source URLs/size metadata normalized) |
 | CI CPU torch override | passed locally | temp-copy lock/dry-run resolves `torch/torchaudio==2.8.0+cpu`, zero `nvidia-*` installs |
 | Bootstrap smoke (explicit token + missing model) | passed locally | wrong token 401; queue/health 200; `/readyz` 503; model dir not created |
-| Full pytest suite | passed locally | 532 passed, 5 deselected in 41.13s (2026-10-24, fresh basetemp) |
+| Full pytest suite | passed locally | 546 passed, 5 deselected (2026-11-01, after the two real-scenario fixes) |
 | Seven P1s (copyback sink, checkpoint identity, finally compare-and-remove, stop/drain tuple-fenced rollback, promotion-error convergence, atomic fenced single-write, worker boot nonce ABA) | **implemented + independently re-verified** | original real-SQLite/file counterexamples re-run; cross-FS `run_translate` fake-HTTP copyback and symlink-swap during copy both pass |
-| Remote CI | **four consecutive green commits** | failures: run 39981535390 @ `bba96a0` (host-only TUNA lock) and run 39995654486 @ `66678d0` (service.log creation order, script-mode wav check before ffprobe). Green: `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310); `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133); `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791) (plus 39997946922/39997927908); `da43057` → [40000383321](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/40000383321). One `main` push of `fd383c9` failed on a non-deterministic restart-recovery test (run 39999279981); the same commit passed in 39998978213/39999284932 and the test is now deterministic |
-| Real 2-hour E2E | **not verified** | 4 configured `/srv/media/...` paths missing; `/srv/media/jellyfin` empty; only 30s/180s samples |
+| Remote CI | **green on every release + fix commit** | failures: run 39981535390 @ `bba96a0` (host-only TUNA lock) and run 39995654486 @ `66678d0` (service.log creation order, script-mode wav check before ffprobe). Green: `2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310); `5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133); `c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791) (plus 39997946922/39997927908); `da43057` → [40000383321](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/40000383321); `384676e` (translate deadline/HTTP-timeout split) → [41242275143](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/41242275143); `0bd6d3d` (JSON trailing-data parsing) → [41244633806](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/41244633806). One `main` push of `fd383c9` failed on a non-deterministic restart-recovery test (run 39999279981); the same commit passed in 39998978213/39999284932 and the test is now deterministic |
+| Real 2-hour E2E | **verified on 3 complete movies** | `/srv/media/jellyfin/JELLYFIN/atmp`: MIDA-853 (2h02m, ja/zh 402 segs), ADN-783-UC (1h58m, 136), CJOD-539-U (1h54m, 3 — mostly non-speech audio). All `extract→stt→translate` succeeded (attempt 0), copy-back sha256 equals local artifacts, checkpoint `source_sha256` matches each `ja.srt`. Details: `docs/superpowers/executions/2026-11-01-real-movie-batch-acceptance.md` |
 | GPU memory peak | **not verified** | `nvidia-smi` exit 255, `NVML GPU access blocked by OS` |
 | Provider-side token rotation | **not done / no evidence** | operator action; local deletion/ignore is not revocation |
 | v0.5.0 tag/release | **pushed** | annotated `v0.5.0` tag points to the final documentation commit on `main` (`git describe --tags --exact-match main`) |
@@ -424,10 +425,14 @@ installed. No paid LLM request was sent during this verification pass.
 - `pyproject.toml` keeps `prometheus-client` in the main dependencies for `/metrics`; if the package is missing at runtime, `/metrics` must degrade gracefully instead of breaking the app.
 - **v0.5.0 tag alignment**: the annotated tag is pushed and points to this final documentation commit; the
   commit on `main`. The historical `v0.4.0` tag was also backfilled at `b029d07`.
-- End-to-end acceptance on a real 2-hour sample (wall-clock per stage, request counts, GPU memory peaks,
-  `kill -9` resume) is **not yet verified**. Re-checked 2026-10-23: the four paths in
-  `tests/e2e/video_paths.txt` under `/srv/media/jellyfin/...` are all missing, `/srv/media/jellyfin` is empty,
-  and only 30s / 180s local samples exist; `nvidia-smi` exits 255 with `NVML GPU access blocked by OS`.
+- Real 2-hour media acceptance **is verified** (2026-11-01): three complete movies from
+  `/srv/media/jellyfin/JELLYFIN/atmp` ran `extract→stt→translate` to `succeeded`, with copy-back hashes equal to
+  the local artifacts. Two product defects found by this run were fixed (`384676e` translate task deadline vs
+  HTTP timeout; `0bd6d3d` JSON extraction with trailing data). Still unverified: GPU memory peaks
+  (`nvidia-smi` exit 255, NVML blocked by OS) and `kill -9` resume.
+- A 2h23m movie (`JUR-897-U`) still fails on one batch whose upstream reply appears to carry no parseable JSON;
+  the task fails loudly after retries instead of writing wrong subtitles. Candidate improvement: fall back to
+  keeping the Japanese source for batches that exhaust parse retries (today only missing-id cases do that).
 - The real HF token and the LLM API key that were once stored on disk must be **rotated by the operator**
   (use `HF_TOKEN` env var for Hugging Face instead of `docs/hf-token.md`). No provider-side revocation
   evidence exists, so token rotation must not be marked complete based on local file cleanup.

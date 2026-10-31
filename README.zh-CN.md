@@ -395,10 +395,10 @@ WHISPER_STT_REAL_MEDIA=1 \
 | 锁图等价性 | 本地通过 | child 144 / root 143 packages；版本、sdist+wheel 哈希、依赖图未变（仅 source URL/size 元数据归一） |
 | CI CPU torch 覆盖 | 本地通过 | 临时副本 lock/dry-run 解析为 `torch/torchaudio==2.8.0+cpu`，待安装 `nvidia-*` 为 0 |
 | 启动冒烟（显式 token + 缺失模型） | 本地通过 | 错误 token 401；queue/health 200；`/readyz` 503；未创建 model 目录 |
-| 全量 pytest | 本地通过 | 532 passed / 5 deselected，41.13s（2026-10-24，全新 basetemp） |
+| 全量 pytest | 本地通过 | 546 passed / 5 deselected（2026-11-01，含两个真实场景修复后） |
 | 七项 P1（copyback sink、checkpoint 固定身份、finally compare-and-remove、stop/drain tuple-fenced rollback、promotion 异常收敛、atomic fenced 单写、worker boot nonce 防 ABA） | **已实现并独立复验** | 原真 SQLite/文件反例重跑通过；跨 FS `run_translate` fake-HTTP copyback 与 copy 期间 symlink 替换两路径通过 |
-| 远端 CI | **连续三个绿色提交** | 失败：run 39981535390 @ `bba96a0`（宿主机 TUNA 锁）、run 39995654486 @ `66678d0`（service.log 创建顺序、脚本 wav 校验在 ffprobe 之后）。绿色：`2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)；`5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)；`c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)，另有 39997946922/39997927908 同为成功 |
-| 真实 2 小时 E2E | **未验证** | `/srv/media/...` 4 条路径都不存在；`/srv/media/jellyfin` 为空；只有 30s/180s 样本 |
+| 远端 CI | **发布与修复提交全绿** | 失败：run 39981535390 @ `bba96a0`（宿主机 TUNA 锁）、run 39995654486 @ `66678d0`（service.log 创建顺序、脚本 wav 校验在 ffprobe 之后）。绿色：`2623545` → [39996457310](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39996457310)；`5e67c7b` → [39997343133](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997343133)；`c88cc80` → [39997953791](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/39997953791)，另有 39997946922/39997927908 同为成功；`da43057` → 40000383321；`384676e`（翻译任务 deadline 与 HTTP 超时解耦） → [41242275143](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/41242275143)；`0bd6d3d`（JSON 尾部内容解析加固） → [41244633806](https://github.com/japan-media-skill-hub/video-stt-translate-server/actions/runs/41244633806) |
+| 真实 2 小时 E2E | **3 部完整影片已验证** | `/srv/media/jellyfin/JELLYFIN/atmp`：MIDA-853（2h02m，ja/zh 各 402 段）、ADN-783-UC（1h58m，136 段）、CJOD-539-U（1h54m，3 段，该片音频以音乐/环境音为主）。`extract→stt→translate` 全部 succeeded（attempt 0），copy_back 与本地产物 sha256 相同，检查点 `source_sha256` 与各自 `ja.srt` 一致。详见 `docs/superpowers/executions/2026-11-01-real-movie-batch-acceptance.md` |
 | GPU 显存峰值 | **未验证** | `nvidia-smi` 退出 255，`NVML GPU access blocked by OS` |
 | 供应商侧 token 轮换 | **未完成 / 无证据** | 属于外部操作；本地删除/忽略不等于撤销 |
 | v0.5.0 tag/发布 | **已 push** | annotated `v0.5.0` tag 指向 `main` 上的最终文档提交（`git describe --tags --exact-match main`） |
@@ -408,10 +408,13 @@ WHISPER_STT_REAL_MEDIA=1 \
 - ruff 基线（`E9` + `F`）在存量模块上仍有告警；CI 只做语法门禁。
 - `pyproject.toml` 为主依赖引入了 `prometheus-client`（`/metrics` 需要）；若运行环境缺少该包，`/metrics` 应优雅降级而不能拖垮应用。
 - **v0.5.0 tag**：annotated tag 已 push 并指向 `main` 上的最终文档提交。历史 `v0.4.0` tag 也已补 push 到 `b029d07`。
-- 真实 2 小时样本端到端验收（各阶段墙钟、请求数、显存峰值、`kill -9` 续跑）**尚未验证**。
-  2026-10-23 复核：`tests/e2e/video_paths.txt` 的 4 条 `/srv/media/jellyfin/...` 路径仍全部不存在，
-  `/srv/media/jellyfin` 为空；本机只有 30s / 180s 样本；`nvidia-smi` 退出 255 并报
-  `NVML GPU access blocked by OS`。
+- 真实 2 小时媒体验收**已验证**（2026-11-01）：`/srv/media/jellyfin/JELLYFIN/atmp` 的 3 部完整影片跑通
+  `extract→stt→translate` 且 copy_back 哈希与本地产物一致；本轮真实测试暴露并修复了两个缺陷
+  （`384676e` 翻译任务 deadline 与 HTTP 超时混用；`0bd6d3d` 模型回复带尾部内容时 JSON 解析失败）。
+  仍未验证：GPU 显存峰值（`nvidia-smi` 退出 255，NVML 被 OS 阻断）与 `kill -9` 续跑。
+- 2h23m 影片 `JUR-897-U` 仍有一个批次持续失败：上游回复疑似不含可解析 JSON，任务在重试耗尽后
+  明确失败（不会写出错误字幕）。候选改进：对 parse 重试耗尽的批次按 C.5 语义回退保留日文原文
+  （当前只有“缺 id”场景会这样降级）。
 - 曾经落盘的 HF token 与 LLM API key 需要**人工轮换**（HF 统一改用 `HF_TOKEN` 环境变量，不再使用 `docs/hf-token.md`）。
   当前没有 provider 端撤销证据，不能仅凭本地文件清理就标记轮换完成。
 
