@@ -191,7 +191,7 @@ def create_app(
         if metrics is None:
             metrics = build_metrics(
                 repo_factory=lambda: getattr(app.state, "repo", None),
-                stages=("extract", "stt", "stt_whisperx", "translate"),
+                stages=("extract", "stt", "stt_whisperx", "stt_qwen", "translate"),
             )
         app.state.metrics = metrics
     else:

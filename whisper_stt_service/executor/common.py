@@ -396,14 +396,21 @@ def preclean_output(path: Path) -> None:
     # 清理失败不应阻断后续流程，让 ffmpeg 自行报告可复现错误。
 
 
-DEFAULT_TRANSLATE_BATCH_SIZE = 200
+# 单批条目数默认值（2026-11-01 验收后 200 → 50）：批次越大，单批 completion 越高、
+# 越容易撞上游输出上限被截断，表现为 parse 错误后重试空转。
+# 实测：100 条 completion 13773–22974 且 finish_reason=error；25 条 16.6s 稳定成功。
+DEFAULT_TRANSLATE_BATCH_SIZE = 50
 DEFAULT_TRANSLATE_MAX_CHARS = 12000
 # 单次请求的输出 token 上限：必须显式下发，否则上游默认上限会在"大批量 + 长译文"
 # 时把 JSON 截断，表现为 parse 错误后重试空转（2026-11-01 实测单批 200 条曾耗 303s 仍解析失败）。
-DEFAULT_TRANSLATE_MAX_TOKENS = 16000
-# 关思考：显式下发 reasoning.enabled=false。当前 OpenRouter + deepseek-v3.2 路由的
-# reasoning_tokens 恒为 0（推理写在正文），该参数对这类路由无可测收益；但对后续
-# 会走独立思考 token 的系列模型是必要开关，故默认关闭思考并保留配置。
+# （2026-11-01 验收后 16000 → 20000：该路由的思考 token 计入 completion，
+# 上限必须留够"思考 + 正文"的总量。）
+DEFAULT_TRANSLATE_MAX_TOKENS = 20000
+# 关思考：仍显式下发 reasoning.enabled=false（用户决定保留）。
+# **旧结论已更正**：这里原先写"reasoning_tokens 恒为 0、无可测收益"，但 2026-11-01
+# 验收单变量对照实测为：enabled=false 仍产生 7185 个 reasoning token（不传 12676、
+# effort=low 6148、max_tokens=0 5732）——该路由把参数当提示而非开关，**只减不关**。
+# 因此思考开销必须按"不可避免"来设计超时与批次；要真正不思考只能换路由/换模型。
 DEFAULT_TRANSLATE_REASONING_ENABLED = False
 
 

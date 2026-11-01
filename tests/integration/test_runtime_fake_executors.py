@@ -174,6 +174,16 @@ WHISPERX_DAG = {
 }
 
 
+STT_QWEN_DAG = {
+    "version": 1,
+    "stages": [
+        {"stage": "extract", "depends_on": []},
+        {"stage": "stt_qwen", "depends_on": ["extract"]},
+        {"stage": "translate", "depends_on": ["stt_qwen"]},
+    ],
+}
+
+
 @dataclass
 class FakeExecutors:
     """可编程 fake 执行器：成功 / 失败 / hang / 取消响应 + 产物发布标记。"""
@@ -382,6 +392,16 @@ class FakeExecutors:
 
         return self._run_asr("stt_whisperx", kwargs)
 
+    def run_stt_qwen(self, **kwargs: Any) -> dict[str, Any]:
+        """fake stt_qwen 执行器。
+
+        与真实执行器同签名（io 别名 + require_audio_artifact + cancel_check）：
+        集成测试只验证"服务把 stt_qwen 当成合法 ASR 阶段接线正确"（wav 契约、
+        产物暂存/正式化、DAG 依赖、copy_back），不加载任何真实权重。
+        """
+
+        return self._run_asr("stt_qwen", kwargs)
+
     def run_translate(self, **kwargs: Any) -> None:
         """fake translate：读取已发布的 ja.srt，写 staging zh.srt（空返回与真实一致）。"""
 
@@ -423,12 +443,14 @@ class Stack:
                 "extract": 2,
                 "stt": 2,
                 "stt_whisperx": 2,
+                "stt_qwen": 2,
                 "translate": 2,
             },
             stage_timeouts={
                 "extract": 60,
                 "stt": 60,
                 "stt_whisperx": 60,
+                "stt_qwen": 60,
                 "translate": 60,
             },
             log_root=self.settings.runtime.log_root,
@@ -441,6 +463,7 @@ class Stack:
         monkeypatch.setattr(runtime_module, "run_extract", self.fake.run_extract)
         monkeypatch.setattr(runtime_module, "run_stt", self.fake.run_stt)
         monkeypatch.setattr(runtime_module, "run_stt_whisperx", self.fake.run_stt_whisperx)
+        monkeypatch.setattr(runtime_module, "run_stt_qwen", self.fake.run_stt_qwen)
         monkeypatch.setattr(runtime_module, "run_translate", self.fake.run_translate)
 
     def _exit_callback(self) -> None:
@@ -641,6 +664,50 @@ def test_whisperx_dag_runs_and_consumes_wav(stack: Stack, tmp_path: Path) -> Non
         assert Path(asr_call["input"]).read_text(encoding="utf-8") == "wav-16k-mono"
         assert ".staging-" not in asr_call["input"]
         assert asr_call["input_suffix"] == ".wav"
+
+
+def test_stt_qwen_dag_runs_and_consumes_wav(stack: Stack, tmp_path: Path) -> None:
+    """显式 stt_qwen DAG 闭环：消费 extract 的 wav，产物经 promotion 后供 translate 读。"""
+
+    runtime = stack.new_runtime()
+    runtime.start()
+    with stack.make_client(runtime) as client:
+        response = stack.submit(client, _video(tmp_path, "qw.mp4"), dag=STT_QWEN_DAG)
+        assert response.status_code in {200, 202}, response.text
+        job_id = response.json()["job_id"]
+
+        wait_until(
+            lambda: stack.job_status(job_id) == "succeeded",
+            description="stt_qwen job succeeded",
+        )
+        assert set(stack.tasks(job_id)) == {"extract", "stt_qwen", "translate"}
+        asr_call = stack.fake.calls_for("stt_qwen")[0]
+        # ASR 必须读正式 wav（extract 的 promotion 结果），而不是私有 staging 路径；
+        # 这条断言守的是 job_repository._build_stage_io 的 ASR 分支有没有漏掉 stt_qwen。
+        assert Path(asr_call["input"]).read_text(encoding="utf-8") == "wav-16k-mono"
+        assert ".staging-" not in asr_call["input"]
+        assert asr_call["input_suffix"] == ".wav"
+        assert asr_call["require_audio_artifact"] is True
+
+
+def test_stt_qwen_dag_rejects_second_asr_stage(tmp_path: Path) -> None:
+    """stt_qwen 与 stt 并列：DAG 内出现两个 ASR 阶段必须被拒（唯一 ASR 语义）。"""
+
+    from whisper_stt_service.core.dag import normalize_and_validate_dag
+
+    with pytest.raises(ValueError) as excinfo:
+        normalize_and_validate_dag(
+            {
+                "version": 1,
+                "stages": [
+                    {"stage": "extract", "depends_on": []},
+                    {"stage": "stt", "depends_on": ["extract"]},
+                    {"stage": "stt_qwen", "depends_on": ["extract"]},
+                    {"stage": "translate", "depends_on": ["stt"]},
+                ],
+            }
+        )
+    assert "asr_stage" in str(excinfo.value) or "dag" in str(excinfo.value)
 
 
 def test_upstream_failure_blocks_downstream(stack: Stack, tmp_path: Path) -> None:

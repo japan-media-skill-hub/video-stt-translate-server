@@ -211,12 +211,14 @@ class JobRepository:
             "extract": 2,
             "stt": 2,
             "stt_whisperx": 2,
+            "stt_qwen": 2,
             "translate": 2,
         }
         self.stage_timeouts = stage_timeouts or {
             "extract": 1200,
             "stt": 7200,
             "stt_whisperx": 7200,
+            "stt_qwen": 5400,
             "translate": 7200,
         }
         self.stage_effective_defaults = stage_effective_defaults or {
@@ -388,7 +390,10 @@ class JobRepository:
 
         if stage == "extract":
             return {"input_path": video_path, "output_path": paths["wav_path"]}
-        if stage in {"stt", "stt_whisperx"}:
+        # stt_qwen 与 stt/stt_whisperx 同为 ASR 阶段：吃 extract 的 wav、产 ja.srt。
+        # 漏掉 stt_qwen 会让 input_path 落到**原视频**上（静默用错输入），
+        # 因此这里必须与 dag.ASR_STAGES 保持一致（单一语义、两处登记）。
+        if stage in {"stt", "stt_whisperx", "stt_qwen"}:
             return {"input_path": paths["wav_path"], "output_path": paths["ja_srt"]}
         if stage == "translate":
             return {

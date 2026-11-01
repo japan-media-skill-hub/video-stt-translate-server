@@ -21,6 +21,9 @@ class WorkerSettings:
     translate_workers: int
     scheduler_interval_sec: int
     poll_interval_sec: int
+    # stt_qwen（新增阶段）：带默认值并追加在末尾，旧调用方/旧测试直接构造
+    # WorkerSettings 时无需改动（与 drain_timeout_sec 同一惯例）。
+    stt_qwen_workers: int = 1
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class TimeoutSettings:
     lease_timeout_sec: int
     # A.6：drain 请求后等待在途任务结束的上限，超时强制回滚本进程 claimed 并退出。
     drain_timeout_sec: int = 300
+    # stt_qwen：2h 片实测推理 8~16 分钟，5400s 余量充足；同样追加在末尾带默认值。
+    stt_qwen_timeout_sec: int = 5400
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,8 @@ class RetrySettings:
     stt_max_retries: int
     stt_whisperx_max_retries: int
     translate_max_retries: int
+    # stt_qwen：沿用既有重试语义，追加在末尾带默认值。
+    stt_qwen_max_retries: int = 2
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,69 @@ class SttWhisperxSettings:
 
 
 @dataclass(frozen=True)
+class SttQwenSettings:
+    """stt_qwen 阶段参数（SPEC §4，对应 `[stt_qwen]` 段）。
+
+    全部键都有默认值，旧配置缺段/缺键可直接加载（默认即**本轮落地档**：
+    nominal=30 / Δback=20 / Δfwd=20 / fallback_fwd=40 → 片长上界 70s / batch=10）。
+    目标档（50/±20/+30/batch13）只改配置、不改代码，见 SPEC §14。
+
+    路径类键（model_dir/aligner_dir/vad_model_dir）与 device/dtype 属于部署事实，
+    **不允许按 job 覆盖**（不在 `STAGE_CONFIG_KEYS["stt_qwen"]` 白名单内）。
+    """
+
+    model_dir: str = "models/qwen3-asr/Qwen3-ASR-1.7B"
+    aligner_dir: str = "models/qwen3-asr/Qwen3-ForcedAligner-0.6B"
+    vad_model_dir: str = "models/vad/fireredvad/VAD"
+    device: str = "cuda:0"
+    dtype: str = "bfloat16"
+    require_cuda: bool = True
+    min_free_vram_gb: float = 12.0
+    vad_use_gpu: bool = True
+    vad_speech_threshold: float = 0.4
+    # 切片参数（两套实测档位都通过这几个键切换）
+    nominal_seconds: float = 30.0
+    delta_back_seconds: float = 20.0
+    delta_forward_seconds: float = 20.0
+    fallback_forward_seconds: float = 40.0
+    min_chunk_seconds: float = 10.0
+    hard_cut_on_miss: bool = True
+    batch_size: int = 10
+    tokens_per_sec: float = 16.0
+    max_segment_sec: float = 30.0
+    min_coverage: float = 0.98
+    strict_output: bool = False
+    align_missing_fallback: str = "chunk_boundary"
+
+    def as_job_config(self) -> dict[str, object]:
+        """转成 stt_qwen 的阶段生效默认值（job_config 仍可覆盖白名单内的键）。
+
+        路径类键由 bootstrap 解析成绝对路径后覆盖（相对路径基于 config 文件目录）。
+        """
+
+        return {
+            "device": self.device,
+            "dtype": self.dtype,
+            "require_cuda": self.require_cuda,
+            "min_free_vram_gb": self.min_free_vram_gb,
+            "vad_use_gpu": self.vad_use_gpu,
+            "vad_speech_threshold": self.vad_speech_threshold,
+            "nominal_seconds": self.nominal_seconds,
+            "delta_back_seconds": self.delta_back_seconds,
+            "delta_forward_seconds": self.delta_forward_seconds,
+            "fallback_forward_seconds": self.fallback_forward_seconds,
+            "min_chunk_seconds": self.min_chunk_seconds,
+            "hard_cut_on_miss": self.hard_cut_on_miss,
+            "batch_size": self.batch_size,
+            "tokens_per_sec": self.tokens_per_sec,
+            "max_segment_sec": self.max_segment_sec,
+            "min_coverage": self.min_coverage,
+            "strict_output": self.strict_output,
+            "align_missing_fallback": self.align_missing_fallback,
+        }
+
+
+@dataclass(frozen=True)
 class SecuritySettings:
     """API 全局访问控制配置。
 
@@ -156,7 +226,8 @@ class TranslationSettings:
     """
 
     parallel: int = 2
-    batch_size: int = 200
+    # 2026-11-01 验收后 200 → 50（与 executor/common.DEFAULT_TRANSLATE_BATCH_SIZE 同一口径）。
+    batch_size: int = 50
     max_chars: int = 12000
     chunk_minutes: int = 20
     timeout_sec: int = 240
@@ -206,6 +277,7 @@ class Settings:
     stt_whisperx: SttWhisperxSettings
     security: SecuritySettings
     # 新增段带默认值：旧测试/旧调用方直接构造 Settings 时无需改动。
+    stt_qwen: SttQwenSettings = SttQwenSettings()
     observability: ObservabilitySettings = ObservabilitySettings()
     translation: TranslationSettings = TranslationSettings()
 
@@ -216,12 +288,14 @@ REQUIRED_CONFIG_OPTIONS: dict[str, tuple[str, ...]] = {
         "extract_workers",
         "stt_workers",
         "stt_whisperx_workers",
+        "stt_qwen_workers",
         "translate_workers",
     ),
     "timeouts": (
         "extract_timeout_sec",
         "stt_timeout_sec",
         "stt_whisperx_timeout_sec",
+        "stt_qwen_timeout_sec",
         "translate_timeout_sec",
         "lease_timeout_sec",
     ),
@@ -229,6 +303,7 @@ REQUIRED_CONFIG_OPTIONS: dict[str, tuple[str, ...]] = {
         "extract_max_retries",
         "stt_max_retries",
         "stt_whisperx_max_retries",
+        "stt_qwen_max_retries",
         "translate_max_retries",
     ),
     "runtime": (
@@ -242,6 +317,9 @@ REQUIRED_CONFIG_OPTIONS: dict[str, tuple[str, ...]] = {
         "model",
     ),
     "security": ("api_token",),
+    # stt_qwen：只把"没有它就跑不起来"的键列为必需。切片参数都有默认值，
+    # 缺键走默认档，不阻塞启动（SPEC §8：默认写本轮落地值）。
+    "stt_qwen": ("model_dir", "aligner_dir", "vad_model_dir"),
 }
 
 
@@ -292,6 +370,11 @@ def load_settings(config_path: Path) -> Settings:
             "stt_whisperx_workers",
             fallback=cp.getint("workers", "stt_workers"),
         ),
+        stt_qwen_workers=cp.getint(
+            "workers",
+            "stt_qwen_workers",
+            fallback=cp.getint("workers", "stt_workers"),
+        ),
         translate_workers=cp.getint("workers", "translate_workers"),
         scheduler_interval_sec=cp.getint(
             "workers", "scheduler_interval_sec", fallback=180
@@ -306,6 +389,11 @@ def load_settings(config_path: Path) -> Settings:
             "stt_whisperx_timeout_sec",
             fallback=cp.getint("timeouts", "stt_timeout_sec"),
         ),
+        stt_qwen_timeout_sec=cp.getint(
+            "timeouts",
+            "stt_qwen_timeout_sec",
+            fallback=cp.getint("timeouts", "stt_timeout_sec"),
+        ),
         translate_timeout_sec=cp.getint("timeouts", "translate_timeout_sec"),
         lease_timeout_sec=cp.getint("timeouts", "lease_timeout_sec"),
         drain_timeout_sec=max(
@@ -318,6 +406,11 @@ def load_settings(config_path: Path) -> Settings:
         stt_whisperx_max_retries=cp.getint(
             "retry",
             "stt_whisperx_max_retries",
+            fallback=cp.getint("retry", "stt_max_retries"),
+        ),
+        stt_qwen_max_retries=cp.getint(
+            "retry",
+            "stt_qwen_max_retries",
             fallback=cp.getint("retry", "stt_max_retries"),
         ),
         translate_max_retries=cp.getint("retry", "translate_max_retries"),
@@ -439,6 +532,7 @@ def load_settings(config_path: Path) -> Settings:
     security = _load_security_settings(cp)
     observability = _load_observability_settings(cp)
     translation = _load_translation_settings(cp)
+    stt_qwen = _load_stt_qwen_settings(cp)
     return Settings(
         workers=workers,
         timeouts=timeouts,
@@ -447,6 +541,7 @@ def load_settings(config_path: Path) -> Settings:
         stt=stt,
         stt_whisperx=stt_whisperx,
         security=security,
+        stt_qwen=stt_qwen,
         observability=observability,
         translation=translation,
     )
@@ -553,6 +648,130 @@ def _load_translation_settings(cp: configparser.ConfigParser) -> TranslationSett
             ),
             0,
         ),
+    )
+
+
+def _load_stt_qwen_settings(cp: configparser.ConfigParser) -> SttQwenSettings:
+    """解析 `[stt_qwen]` 段；缺段/缺键即取默认值（默认 = 本轮落地档）。
+
+    只做"读 + 收边界"，**不在这里校验 `nominal + fallback_forward <= 180`**：
+    那条规则由 `executor.qwen_boundary.BoundaryParams.validate()` 单一事实源负责，
+    避免同一语义在两处各写一份、日后改一处漏一处。
+    """
+
+    defaults = SttQwenSettings()
+    return SttQwenSettings(
+        model_dir=cp.get(
+            "stt_qwen", "model_dir", fallback=defaults.model_dir
+        ).strip()
+        or defaults.model_dir,
+        aligner_dir=cp.get(
+            "stt_qwen", "aligner_dir", fallback=defaults.aligner_dir
+        ).strip()
+        or defaults.aligner_dir,
+        vad_model_dir=cp.get(
+            "stt_qwen", "vad_model_dir", fallback=defaults.vad_model_dir
+        ).strip()
+        or defaults.vad_model_dir,
+        device=cp.get("stt_qwen", "device", fallback=defaults.device).strip()
+        or defaults.device,
+        dtype=cp.get("stt_qwen", "dtype", fallback=defaults.dtype).strip().lower()
+        or defaults.dtype,
+        require_cuda=cp.getboolean(
+            "stt_qwen", "require_cuda", fallback=defaults.require_cuda
+        ),
+        min_free_vram_gb=max(
+            cp.getfloat(
+                "stt_qwen", "min_free_vram_gb", fallback=defaults.min_free_vram_gb
+            ),
+            0.0,
+        ),
+        vad_use_gpu=cp.getboolean(
+            "stt_qwen", "vad_use_gpu", fallback=defaults.vad_use_gpu
+        ),
+        vad_speech_threshold=min(
+            max(
+                cp.getfloat(
+                    "stt_qwen",
+                    "vad_speech_threshold",
+                    fallback=defaults.vad_speech_threshold,
+                ),
+                0.01,
+            ),
+            0.99,
+        ),
+        nominal_seconds=max(
+            cp.getfloat(
+                "stt_qwen", "nominal_seconds", fallback=defaults.nominal_seconds
+            ),
+            0.1,
+        ),
+        delta_back_seconds=max(
+            cp.getfloat(
+                "stt_qwen", "delta_back_seconds", fallback=defaults.delta_back_seconds
+            ),
+            0.1,
+        ),
+        delta_forward_seconds=max(
+            cp.getfloat(
+                "stt_qwen",
+                "delta_forward_seconds",
+                fallback=defaults.delta_forward_seconds,
+            ),
+            0.1,
+        ),
+        fallback_forward_seconds=max(
+            cp.getfloat(
+                "stt_qwen",
+                "fallback_forward_seconds",
+                fallback=defaults.fallback_forward_seconds,
+            ),
+            0.1,
+        ),
+        min_chunk_seconds=max(
+            cp.getfloat(
+                "stt_qwen",
+                "min_chunk_seconds",
+                fallback=defaults.min_chunk_seconds,
+            ),
+            0.1,
+        ),
+        hard_cut_on_miss=cp.getboolean(
+            "stt_qwen", "hard_cut_on_miss", fallback=defaults.hard_cut_on_miss
+        ),
+        batch_size=max(
+            cp.getint("stt_qwen", "batch_size", fallback=defaults.batch_size), 1
+        ),
+        tokens_per_sec=max(
+            cp.getfloat(
+                "stt_qwen", "tokens_per_sec", fallback=defaults.tokens_per_sec
+            ),
+            0.1,
+        ),
+        max_segment_sec=max(
+            cp.getfloat(
+                "stt_qwen", "max_segment_sec", fallback=defaults.max_segment_sec
+            ),
+            0.1,
+        ),
+        min_coverage=min(
+            max(
+                cp.getfloat(
+                    "stt_qwen", "min_coverage", fallback=defaults.min_coverage
+                ),
+                0.0,
+            ),
+            1.0,
+        ),
+        strict_output=cp.getboolean(
+            "stt_qwen", "strict_output", fallback=defaults.strict_output
+        ),
+        align_missing_fallback=cp.get(
+            "stt_qwen",
+            "align_missing_fallback",
+            fallback=defaults.align_missing_fallback,
+        ).strip()
+        or defaults.align_missing_fallback,
     )
 
 

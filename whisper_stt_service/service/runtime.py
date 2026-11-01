@@ -25,13 +25,16 @@ from whisper_stt_service.executor.common import ExecutorCancelledError
 from whisper_stt_service.core.config import Settings
 from whisper_stt_service.executor import (
     build_stt_effective_config,
+    build_stt_qwen_effective_config,
     build_stt_whisperx_effective_config,
     run_extract,
     run_stt,
+    run_stt_qwen,
     run_stt_whisperx,
     run_translate,
 )
 from whisper_stt_service.core.progress import ProgressStore
+from whisper_stt_service.executor.qwen_boundary import BoundaryParams
 from whisper_stt_service.core.security import SecurityError, resolve_copy_back_dir
 from whisper_stt_service.executor.atomic import atomic_write_text
 from whisper_stt_service.repo.job_repository import JobRepository
@@ -335,6 +338,9 @@ class WorkerRuntime:
         self._spawn_stage_workers(
             "stt_whisperx", self.settings.workers.stt_whisperx_workers
         )
+        self._spawn_stage_workers(
+            "stt_qwen", self.settings.workers.stt_qwen_workers
+        )
         self._spawn_stage_workers("translate", self.settings.workers.translate_workers)
         return self._startup_stats["recovered"]
 
@@ -569,6 +575,7 @@ class WorkerRuntime:
             ("extract", self.settings.workers.extract_workers),
             ("stt", self.settings.workers.stt_workers),
             ("stt_whisperx", self.settings.workers.stt_whisperx_workers),
+            ("stt_qwen", self.settings.workers.stt_qwen_workers),
             ("translate", self.settings.workers.translate_workers),
         ):
             for idx in range(max(int(count), 0)):
@@ -1116,6 +1123,10 @@ class WorkerRuntime:
             return self._execute_stt_whisperx(
                 ctx, task_cfg, cancel_check, output_path=staging.staged_path
             )
+        if stage == "stt_qwen":
+            return self._execute_stt_qwen(
+                ctx, task_cfg, cancel_check, output_path=staging.staged_path
+            )
         if stage == "translate":
             self._execute_translate(
                 ctx, task_cfg, cancel_check, staging=staging, lease=lease
@@ -1134,7 +1145,7 @@ class WorkerRuntime:
 
         if stage == "extract":
             final_path = self._resolve_extract_output(ctx)
-        elif stage in {"stt", "stt_whisperx"}:
+        elif stage in {"stt", "stt_whisperx", "stt_qwen"}:
             final_path = self._resolve_asr_output(ctx)
         elif stage == "translate":
             final_path = self._resolve_translate_output(ctx)
@@ -1788,6 +1799,89 @@ class WorkerRuntime:
             "require_audio_artifact": True,
         }
         return _call_executor(run_stt_whisperx, kwargs, cancel_check)
+    def _execute_stt_qwen(
+        self,
+        ctx,
+        task_cfg: dict,
+        cancel_check: Callable[[], bool],
+        *,
+        output_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """执行 stt_qwen 阶段（本地 Qwen3-ASR + FireRedVAD 定点切片）并返回生效快照。
+
+        output_path 语义同 `_execute_stt`：默认暂存路径，promotion 后才成为正式产物。
+        job_config 覆盖优先级：task_cfg（白名单键）> [stt_qwen]（装配期默认值）。
+        """
+
+        settings = self.settings.stt_qwen
+        kwargs: dict[str, Any] = {
+            "input_path": self._resolve_asr_input(ctx),
+            "output_path": output_path or self._resolve_asr_output(ctx),
+            "language": ctx.source_language,
+            "timeout_sec": int(task_cfg.get("timeout_sec", ctx.timeout_sec)),
+            "max_retries": int(task_cfg.get("max_retries", ctx.max_retries)),
+            # 路径/设备属于部署事实：只认装配期默认值，job_config 无法覆盖
+            # （白名单里根本没有这些键，越权覆盖会在 DAG 校验阶段就被拒）。
+            "model_dir": str(task_cfg.get("model_dir", settings.model_dir)),
+            "aligner_dir": str(task_cfg.get("aligner_dir", settings.aligner_dir)),
+            "vad_model_dir": str(task_cfg.get("vad_model_dir", settings.vad_model_dir)),
+            "device": str(task_cfg.get("device", settings.device)),
+            "dtype": str(task_cfg.get("dtype", settings.dtype)),
+            "require_cuda": bool(task_cfg.get("require_cuda", settings.require_cuda)),
+            "min_free_vram_gb": float(
+                task_cfg.get("min_free_vram_gb", settings.min_free_vram_gb)
+            ),
+            "vad_use_gpu": bool(task_cfg.get("vad_use_gpu", settings.vad_use_gpu)),
+            "vad_speech_threshold": float(
+                task_cfg.get("vad_speech_threshold", settings.vad_speech_threshold)
+            ),
+            "nominal_seconds": float(
+                task_cfg.get("nominal_seconds", settings.nominal_seconds)
+            ),
+            "delta_back_seconds": float(
+                task_cfg.get("delta_back_seconds", settings.delta_back_seconds)
+            ),
+            "delta_forward_seconds": float(
+                task_cfg.get("delta_forward_seconds", settings.delta_forward_seconds)
+            ),
+            "fallback_forward_seconds": float(
+                task_cfg.get(
+                    "fallback_forward_seconds", settings.fallback_forward_seconds
+                )
+            ),
+            "min_chunk_seconds": float(
+                task_cfg.get("min_chunk_seconds", settings.min_chunk_seconds)
+            ),
+            "hard_cut_on_miss": bool(
+                task_cfg.get("hard_cut_on_miss", settings.hard_cut_on_miss)
+            ),
+            "batch_size": int(task_cfg.get("batch_size", settings.batch_size)),
+            "tokens_per_sec": float(
+                task_cfg.get("tokens_per_sec", settings.tokens_per_sec)
+            ),
+            "max_segment_sec": float(
+                task_cfg.get("max_segment_sec", settings.max_segment_sec)
+            ),
+            "min_coverage": float(
+                task_cfg.get("min_coverage", settings.min_coverage)
+            ),
+            "strict_output": bool(
+                task_cfg.get("strict_output", settings.strict_output)
+            ),
+            "align_missing_fallback": str(
+                task_cfg.get(
+                    "align_missing_fallback", settings.align_missing_fallback
+                )
+            ),
+            "progress_queue": self._progress_queue,
+            "task_id": ctx.task_id,
+            "worker_id": self._current_worker_id(ctx.task_id),
+            # D1：同 run_stt/run_stt_whisperx，wav 缺失或为空即失败
+            # （missing_audio_artifact），绝不静默回退到原视频。
+            "require_audio_artifact": True,
+        }
+        return _call_executor(run_stt_qwen, kwargs, cancel_check)
+
     def _execute_translate(
         self,
         ctx,
@@ -2315,6 +2409,96 @@ class WorkerRuntime:
             payload["effective_config"] = build_stt_whisperx_effective_config(
                 **merged_whisperx
             )
+        if stage == "stt_qwen":
+            qwen_settings = self.settings.stt_qwen
+            merged_qwen = {
+                "language": ctx.source_language,
+                "timeout_sec": int(effective.get("timeout_sec", ctx.timeout_sec)),
+                "max_retries": int(effective.get("max_retries", ctx.max_retries)),
+                "model_dir": str(effective.get("model_dir", qwen_settings.model_dir)),
+                "aligner_dir": str(
+                    effective.get("aligner_dir", qwen_settings.aligner_dir)
+                ),
+                "vad_model_dir": str(
+                    effective.get("vad_model_dir", qwen_settings.vad_model_dir)
+                ),
+                "device": str(effective.get("device", qwen_settings.device)),
+                "dtype": str(effective.get("dtype", qwen_settings.dtype)),
+                "batch_size": int(
+                    effective.get("batch_size", qwen_settings.batch_size)
+                ),
+                "params": BoundaryParams(
+                    nominal_seconds=float(
+                        effective.get(
+                            "nominal_seconds", qwen_settings.nominal_seconds
+                        )
+                    ),
+                    delta_back_seconds=float(
+                        effective.get(
+                            "delta_back_seconds", qwen_settings.delta_back_seconds
+                        )
+                    ),
+                    delta_forward_seconds=float(
+                        effective.get(
+                            "delta_forward_seconds",
+                            qwen_settings.delta_forward_seconds,
+                        )
+                    ),
+                    fallback_forward_seconds=float(
+                        effective.get(
+                            "fallback_forward_seconds",
+                            qwen_settings.fallback_forward_seconds,
+                        )
+                    ),
+                    min_chunk_seconds=float(
+                        effective.get(
+                            "min_chunk_seconds", qwen_settings.min_chunk_seconds
+                        )
+                    ),
+                    hard_cut_on_miss=bool(
+                        effective.get(
+                            "hard_cut_on_miss", qwen_settings.hard_cut_on_miss
+                        )
+                    ),
+                ),
+                "tokens_per_sec": float(
+                    effective.get("tokens_per_sec", qwen_settings.tokens_per_sec)
+                ),
+                "max_segment_sec": float(
+                    effective.get("max_segment_sec", qwen_settings.max_segment_sec)
+                ),
+                "vad_use_gpu": bool(
+                    effective.get("vad_use_gpu", qwen_settings.vad_use_gpu)
+                ),
+                "vad_speech_threshold": float(
+                    effective.get(
+                        "vad_speech_threshold", qwen_settings.vad_speech_threshold
+                    )
+                ),
+                "min_free_vram_gb": float(
+                    effective.get(
+                        "min_free_vram_gb", qwen_settings.min_free_vram_gb
+                    )
+                ),
+                "min_coverage": float(
+                    effective.get("min_coverage", qwen_settings.min_coverage)
+                ),
+                "strict_output": bool(
+                    effective.get("strict_output", qwen_settings.strict_output)
+                ),
+                "align_missing_fallback": str(
+                    effective.get(
+                        "align_missing_fallback",
+                        qwen_settings.align_missing_fallback,
+                    )
+                ),
+            }
+            # 注意：本快照只做"如实记录"，**不做参数校验**——切片参数的合法性由
+            # `qwen_boundary.BoundaryParams.validate()` 按单一事实源在执行器入口判定；
+            # 这里若再校验一遍，同一语义就有两份实现（改一处漏一处）。
+            payload["effective_config"] = build_stt_qwen_effective_config(
+                **merged_qwen
+            )
         return payload
 
     def _effective_snapshot(
@@ -2327,7 +2511,7 @@ class WorkerRuntime:
         `effective_config` 字段与该 task 实际生效配置一致。
         """
 
-        if stage not in {"stt", "stt_whisperx"}:
+        if stage not in {"stt", "stt_whisperx", "stt_qwen"}:
             return None
         extra = self._build_task_started_extra(
             ctx=ctx, stage=stage, task_cfg=task_cfg

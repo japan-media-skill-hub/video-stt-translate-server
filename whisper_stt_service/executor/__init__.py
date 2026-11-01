@@ -16,6 +16,14 @@ from whisper_stt_service.executor.stt_whisperx import (
     build_stt_whisperx_effective_config,
     run_stt_whisperx,
 )
+from whisper_stt_service.executor.qwen_boundary import (
+    BoundaryParams,
+    pick_cuts,
+)
+from whisper_stt_service.executor.stt_qwen import (
+    build_stt_qwen_effective_config,
+    run_stt_qwen,
+)
 from whisper_stt_service.executor.translate import run_translate
 
 __all__ = [
@@ -23,11 +31,15 @@ __all__ = [
     "_build_translate_messages",
     "_resolve_runtime",
     "_split_entries_by_time_window",
+    "BoundaryParams",
     "build_stt_effective_config",
+    "build_stt_qwen_effective_config",
     "build_stt_whisperx_effective_config",
+    "pick_cuts",
     "preclean_output",
     "run_extract",
     "run_stt",
+    "run_stt_qwen",
     "run_stt_whisperx",
     "run_translate",
 ]

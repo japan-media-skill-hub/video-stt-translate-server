@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-SUPPORTED_STAGES = ("extract", "stt", "stt_whisperx", "translate")
+SUPPORTED_STAGES = ("extract", "stt", "stt_whisperx", "stt_qwen", "translate")
 
 # 每个阶段允许覆盖的配置键。
 STAGE_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
@@ -44,6 +44,25 @@ STAGE_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
         "vad_onset",
         "vad_offset",
         "local_files_only",
+    ),
+    # stt_qwen：本地 Qwen3-ASR + FireRedVAD 定点切片。
+    # 这里只放"按 job 覆盖安全"的键：切片/批参数会影响产物，允许按 job 调；
+    # 模型目录、device、dtype 属于部署事实，禁止按 job 覆盖（否则作业可以偷偷
+    # 换权重或把推理挪到 CPU），因此**不在白名单内**（SPEC §5-1）。
+    "stt_qwen": (
+        "timeout_sec",
+        "max_retries",
+        "nominal_seconds",
+        "delta_back_seconds",
+        "delta_forward_seconds",
+        "fallback_forward_seconds",
+        "min_chunk_seconds",
+        "hard_cut_on_miss",
+        "batch_size",
+        "tokens_per_sec",
+        "max_segment_sec",
+        "min_coverage",
+        "strict_output",
     ),
     # translate：SPEC C.2 要求 [translation] 的全部可覆盖参数都能按 job 覆盖；
     # timeout_sec/max_retries 是本服务历史通用的任务超时/重试键，与 new 键并存且约定不变。

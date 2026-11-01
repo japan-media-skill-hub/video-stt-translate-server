@@ -41,10 +41,12 @@ def _dag(*stages: tuple[str, list[str]], version: object = 1) -> dict:
 @pytest.mark.parametrize(
     "asr_stage",
     list(ASR_STAGES),
-    ids=["stt", "stt_whisperx"],
+    # id 直接跟随 ASR_STAGES：新增 ASR 阶段时用例自动覆盖，不再硬编码名字
+    # （stt_qwen 落地时这里曾因 ids 写死而参数个数不匹配）。
+    ids=list(ASR_STAGES),
 )
 def test_legal_dag_with_translate(asr_stage: str) -> None:
-    """extract -> (stt|stt_whisperx) -> translate 均应通过校验。"""
+    """extract -> (stt|stt_whisperx|stt_qwen) -> translate 均应通过校验。"""
 
     raw = _dag(
         ("extract", []),

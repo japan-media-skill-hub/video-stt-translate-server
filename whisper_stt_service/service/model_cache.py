@@ -419,6 +419,7 @@ class ModelCache:
         whisperx_load_model: Callable[..., Any] | None = None,
         whisperx_vad_factory: Callable[..., Any] | None = None,
         whisperx_align_loader: Callable[..., Any] | None = None,
+        qwen_asr_bundle_loader: Callable[..., Any] | None = None,
     ) -> None:
         """构造缓存；loader 全部可注入，默认按需惰性导入真实依赖。"""
 
@@ -446,6 +447,8 @@ class ModelCache:
         self._whisperx_load_model = whisperx_load_model
         self._whisperx_vad_factory = whisperx_vad_factory
         self._whisperx_align_loader = whisperx_align_loader
+        # stt_qwen 双语模型 + FireRedVAD 打包加载器（测试可注入伪实现，避免真下权重）。
+        self._qwen_asr_bundle_loader = qwen_asr_bundle_loader
         self.configure(
             cache_size=cache_size,
             parallelism=parallelism,
@@ -796,6 +799,129 @@ class ModelCache:
             loader=_loader,
         )
 
+    def qwen_asr_bundle_key(
+        self,
+        *,
+        model_dir: str | Path,
+        aligner_dir: str | Path,
+        vad_model_dir: str | Path,
+        device: str,
+        dtype: str,
+        max_new_tokens: int,
+        batch_size: int,
+        vad_use_gpu: bool,
+        vad_speech_threshold: float,
+    ) -> Hashable:
+        """返回 stt_qwen 打包条目的内部 key（`get_*` 与 `has_*` 共用同一份构造）。
+
+        key 覆盖模型目录、对齐目录、VAD 目录、device、dtype、`max_new_tokens`、
+        `batch_size`、VAD 设备与阈值——其中任何一个不同都可能改变显存占用或
+        输出，绝不能串用（SPEC §5-10 的 key 要求）。
+        """
+
+        resolved_device, _ = resolve_runtime_hint(device, dtype)
+        return _hashable(
+            (
+                "qwen_asr_bundle",
+                str(model_dir),
+                str(aligner_dir),
+                str(vad_model_dir),
+                str(resolved_device),
+                str(dtype),
+                int(max_new_tokens),
+                int(batch_size),
+                bool(vad_use_gpu),
+                float(vad_speech_threshold),
+                self._parallelism,
+            )
+        )
+
+    def has_qwen_asr_bundle(self, **kwargs: Any) -> bool:
+        """该参数组合是否**已经**在进程内缓存里（不加载、不占用引用）。
+
+        用途：执行器的"加载前空闲显存门槛"必须区分两种情况——
+        - 冷启动：要真的再吃掉约 10~14GB，必须先确认空闲足够；
+        - 命中缓存：显存**已经在进程里**了（`mem_get_info()` 会把缓存分配器
+          持有的块算成已用，看到 free≈0），此时再要求"空闲 ≥ 12GB"必然误判失败。
+        2026-11-01 验收实测：第 1 部片成功后，第 2/3 部片连续 3 次以
+        `stt_qwen_insufficient_vram: free=0.00GiB` 失败——就是这个误判。
+        """
+
+        try:
+            key = self.qwen_asr_bundle_key(**kwargs)
+        except TypeError:
+            # 参数不完整时保守返回 False（当作冷启动，照常走显存门槛）。
+            return False
+        with self._lock:
+            return key in self._entries
+
+    def get_qwen_asr_bundle(
+        self,
+        *,
+        model_dir: str | Path,
+        aligner_dir: str | Path,
+        vad_model_dir: str | Path,
+        device: str,
+        dtype: str,
+        max_new_tokens: int,
+        batch_size: int,
+        vad_use_gpu: bool,
+        vad_speech_threshold: float,
+    ) -> ModelLease:
+        """获取 stt_qwen 的 `(asr_model, vad_model)` 租约（SPEC §5-10）。
+
+        两个模型打包成一条缓存条目：VAD 只有 588K 参数，但每部片都重新
+        `from_pretrained` 仍要读盘 + 建图；与 ASR 同生命周期最省事，也保证
+        "片长/批大小变了就整体重载"，不会出现半新半旧的参数组合。
+
+        key 构造与 `has_qwen_asr_bundle` 共用 `qwen_asr_bundle_key`（单一事实源）。
+        """
+
+        resolved_device, _ = resolve_runtime_hint(device, dtype)
+        key = self.qwen_asr_bundle_key(
+            model_dir=model_dir,
+            aligner_dir=aligner_dir,
+            vad_model_dir=vad_model_dir,
+            device=device,
+            dtype=dtype,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            vad_use_gpu=vad_use_gpu,
+            vad_speech_threshold=vad_speech_threshold,
+        )
+        display = make_cache_key(
+            "qwen_asr_bundle",
+            model=str(model_dir),
+            aligner=str(aligner_dir),
+            vad=str(vad_model_dir),
+            device=str(resolved_device),
+            dtype=str(dtype),
+            max_new_tokens=int(max_new_tokens),
+            batch=int(batch_size),
+            vad_gpu=bool(vad_use_gpu),
+            vad_threshold=float(vad_speech_threshold),
+        )
+
+        def _loader() -> tuple[Any, ...]:
+            return self._load_qwen_asr_bundle(
+                model_dir=str(model_dir),
+                aligner_dir=str(aligner_dir),
+                vad_model_dir=str(vad_model_dir),
+                device=str(resolved_device),
+                dtype=str(dtype),
+                max_new_tokens=int(max_new_tokens),
+                batch_size=int(batch_size),
+                vad_use_gpu=bool(vad_use_gpu),
+                vad_speech_threshold=float(vad_speech_threshold),
+            )
+
+        return self._acquire(
+            kind="stt_qwen",
+            key=key,
+            display_key=display,
+            loader=_loader,
+        )
+
     def get_align_model(
         self,
         language: str,
@@ -1013,7 +1139,7 @@ class ModelCache:
                         exc,
                         exc.__class__.__name__,
                     )
-        if entry.kind in {"stt", "stt_whisperx"}:
+        if entry.kind in {"stt", "stt_whisperx", "stt_qwen"}:
             try:
                 import torch  # type: ignore
 
@@ -1154,6 +1280,70 @@ class ModelCache:
                 language=language, device=device, model_dir=align_model_path
             )
         return (asr, vad_model, align_model, align_meta)
+
+    def _load_qwen_asr_bundle(
+        self,
+        *,
+        model_dir: str,
+        aligner_dir: str,
+        vad_model_dir: str,
+        device: str,
+        dtype: str,
+        max_new_tokens: int,
+        batch_size: int,
+        vad_use_gpu: bool,
+        vad_speech_threshold: float,
+    ) -> tuple[Any, ...]:
+        """加载 stt_qwen 的 ASR（含强制对齐器）与 FireRedVAD 两个模型。
+
+        全部走**本地目录**：`Qwen3ASRModel.from_pretrained(model_dir, ...)` 的
+        位置参数是路径而非 hub id，`forced_aligner` 同样是本地路径；FireRedVAD
+        从 `vad_model_dir` 读 `model.pth.tar`/`cmvn.ark`。因此本阶段运行期零联网。
+
+        `max_new_tokens` 与 `max_inference_batch_size` 都是加载期参数
+        （见 `qwen_asr.inference.Qwen3ASRModel.from_pretrained`），所以它们必须进
+        缓存 key：片长/批大小变了必须整体重载，不能拿旧实例凑合。
+        """
+
+        if self._qwen_asr_bundle_loader is not None:
+            # 测试注入路径：不碰真实权重（单测/集成测试禁止下载或加载 4.4G 模型）。
+            return tuple(self._qwen_asr_bundle_loader(
+                model_dir=model_dir,
+                aligner_dir=aligner_dir,
+                vad_model_dir=vad_model_dir,
+                device=device,
+                dtype=dtype,
+                max_new_tokens=int(max_new_tokens),
+                batch_size=int(batch_size),
+                vad_use_gpu=bool(vad_use_gpu),
+                vad_speech_threshold=float(vad_speech_threshold),
+            ))
+
+        import torch  # type: ignore
+
+        from qwen_asr import Qwen3ASRModel
+
+        torch_dtype = getattr(torch, str(dtype))
+        asr_model = Qwen3ASRModel.from_pretrained(
+            model_dir,
+            dtype=torch_dtype,
+            device_map=device,
+            max_inference_batch_size=int(batch_size),
+            max_new_tokens=int(max_new_tokens),
+            forced_aligner=aligner_dir,
+            forced_aligner_kwargs=dict(dtype=torch_dtype, device_map=device),
+        )
+
+        from fireredvad.vad import FireRedVad, FireRedVadConfig
+
+        vad_model = FireRedVad.from_pretrained(
+            vad_model_dir,
+            FireRedVadConfig(
+                use_gpu=1 if bool(vad_use_gpu) and device.startswith("cuda") else 0,
+                speech_threshold=float(vad_speech_threshold),
+            ),
+        )
+        return (asr_model, vad_model)
 
     def _load_align(
         self, *, language: str, device: str, model_dir: str | Path | None

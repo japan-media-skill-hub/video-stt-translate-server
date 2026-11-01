@@ -22,6 +22,9 @@ from whisper_stt_service.executor.atomic import (
     atomic_write_text_fenced,
 )
 from whisper_stt_service.executor.common import (
+    DEFAULT_TRANSLATE_BATCH_SIZE,
+    DEFAULT_TRANSLATE_MAX_TOKENS,
+    DEFAULT_TRANSLATE_REASONING_ENABLED,
     ExecutorCancelledError,
     JsonExtractionError,
     MissingAudioArtifactError,
@@ -2330,6 +2333,72 @@ def test_call_translate_api_sends_max_tokens_and_reasoning_switch() -> None:
     assert "reasoning" not in captured
 
 
+def test_shipped_config_example_matches_code_defaults() -> None:
+    """模板与代码默认值必须一致（同一语义只定义一处，防止悄悄漂移）。
+
+    2026-11-01 验收后把 `batch_size` 100→50、`max_tokens` 16000→20000：这两项
+    同时存在于 `config.example.ini` 与代码默认值里，任何一处漏改都会让"缺键时的
+    回退值"与"模板值"不一致——用一条用例把两侧钉在一起。
+    """
+
+    example = Path(__file__).resolve().parents[2] / "config.example.ini"
+    assert example.is_file(), example
+    cfg = configparser.ConfigParser()
+    cfg.read(example, encoding="utf-8")
+    assert cfg.getint("translation", "batch_size") == DEFAULT_TRANSLATE_BATCH_SIZE
+    assert cfg.getint("translation", "max_tokens") == DEFAULT_TRANSLATE_MAX_TOKENS
+    assert cfg.getboolean("translation", "reasoning_enabled") is DEFAULT_TRANSLATE_REASONING_ENABLED
+
+
+def test_shipped_config_values_reach_the_request_body() -> None:
+    """配置 → settings → 请求体 全链路：50 条/批、max_tokens=20000、仍下发关思考。
+
+    这条补的是"改了配置但没真正生效"的盲区：只断言 settings 不够，必须看到
+    `json` 里真的带 `max_tokens: 20000` 与 `reasoning: {"enabled": false}`。
+    """
+
+    example = Path(__file__).resolve().parents[2] / "config.example.ini"
+    cfg = configparser.ConfigParser()
+    cfg.read(example, encoding="utf-8")
+    settings = resolve_translate_settings(cfg, {})
+    assert settings.batch_size == DEFAULT_TRANSLATE_BATCH_SIZE
+    assert settings.max_tokens == DEFAULT_TRANSLATE_MAX_TOKENS
+    assert settings.reasoning_enabled is False
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({"1": "你好"})}}]}
+
+    def post(url: str, **kwargs):
+        captured.clear()
+        captured.update(kwargs.get("json") or {})
+        return _Resp()
+
+    _call_translate_api(
+        post,
+        base_url="https://x/v1",
+        api_key="k",
+        model="m",
+        timeout_sec=30,
+        batch=[
+            SrtEntry(
+                index=1, timestamp="00:00:00,000 --> 00:00:01,000", text="こんにちは"
+            )
+        ],
+        max_tokens=settings.max_tokens,
+        reasoning_enabled=settings.reasoning_enabled,
+    )
+    assert captured["max_tokens"] == 20000
+    assert captured["reasoning"] == {"enabled": False}
+
+
 def test_translate_settings_reads_max_tokens_and_reasoning_from_config() -> None:
     """`[translation]` 的 max_tokens / reasoning_enabled 必须能解析进 settings。"""
 
@@ -2341,5 +2410,6 @@ def test_translate_settings_reads_max_tokens_and_reasoning_from_config() -> None
 
     # 缺省取代码默认：16000 + 关思考。
     default_settings = resolve_translate_settings(configparser.ConfigParser(), None)
-    assert default_settings.max_tokens == 16000
+    # 2026-11-01 验收后默认上限 16000 → 20000（该路由的思考 token 计入 completion）。
+    assert default_settings.max_tokens == 20000
     assert default_settings.reasoning_enabled is False

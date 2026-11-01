@@ -10,7 +10,7 @@ from whisper_stt_service.core.stages import STAGE_CONFIG_KEYS, SUPPORTED_STAGES
 SUPPORTED_DAG_VERSION = 1
 
 # 互斥的 ASR 阶段：DAG 中必须恰好出现一个（SPEC B.2-2、D1 的 wav 契约）。
-ASR_STAGES: tuple[str, ...] = ("stt", "stt_whisperx")
+ASR_STAGES: tuple[str, ...] = ("stt", "stt_whisperx", "stt_qwen")
 
 # ASR 的硬前置阶段：ASR 必须消费 extract 产出的 16k mono wav（SPEC B.2-3、E）。
 REQUIRED_ASR_UPSTREAM_STAGE = "extract"
@@ -175,6 +175,10 @@ def _validate_stage_config_value(stage: str, key: str, value: object) -> None:
         ("stt_whisperx", "timeout_sec"): 1,
         ("stt_whisperx", "max_retries"): 0,
         ("stt_whisperx", "batch_size"): 1,
+        # stt_qwen：任务级超时/重试与批大小（batch 越大显存越高，必须为正）。
+        ("stt_qwen", "timeout_sec"): 1,
+        ("stt_qwen", "max_retries"): 0,
+        ("stt_qwen", "batch_size"): 1,
         ("translate", "timeout_sec"): 1,
         ("translate", "max_retries"): 0,
         ("translate", "chunk_minutes"): 1,
@@ -197,18 +201,33 @@ def _validate_stage_config_value(stage: str, key: str, value: object) -> None:
         ("stt", "hallucination_silence_threshold"): 0.0,
         # SPEC D2：批次派发间隔（秒），0 表示关闭节流。
         ("translate", "request_interval"): 0.0,
+        # stt_qwen 切片参数：全部是"秒"量纲的时长，必须为正。
+        ("stt_qwen", "nominal_seconds"): 0.1,
+        ("stt_qwen", "delta_back_seconds"): 0.1,
+        ("stt_qwen", "delta_forward_seconds"): 0.1,
+        ("stt_qwen", "fallback_forward_seconds"): 0.1,
+        ("stt_qwen", "min_chunk_seconds"): 0.1,
+        # 每片字符预算系数（字/秒），必须为正。
+        ("stt_qwen", "tokens_per_sec"): 0.1,
+        # 字幕单段上限（秒），必须为正。
+        ("stt_qwen", "max_segment_sec"): 0.1,
     }
     float_range_rules: dict[tuple[str, str], tuple[float, float]] = {
         ("stt", "vad_threshold"): (0.01, 0.99),
         ("stt", "no_speech_threshold"): (0.01, 0.99),
         ("stt_whisperx", "vad_onset"): (0.01, 0.99),
         ("stt_whisperx", "vad_offset"): (0.01, 0.99),
+        # stt_qwen 覆盖率门槛：0~1 的比例。
+        ("stt_qwen", "min_coverage"): (0.0, 1.0),
     }
     bool_rules = {
         ("stt", "condition_on_previous_text"),
         ("stt", "vad_filter"),
         ("stt_whisperx", "align_enabled"),
         ("stt_whisperx", "local_files_only"),
+        # stt_qwen：硬切开关与"覆盖率不足即失败"开关。
+        ("stt_qwen", "hard_cut_on_miss"),
+        ("stt_qwen", "strict_output"),
         # SPEC C.2/C.4/C.5：布尔开关不接受 int/str，避免 "false" 被当成 true。
         ("translate", "disable_proxy"),
         ("translate", "checkpoint_enabled"),

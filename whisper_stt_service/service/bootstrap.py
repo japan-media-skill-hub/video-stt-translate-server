@@ -129,11 +129,36 @@ def _build_stage_effective_defaults(
             "vad_offset": settings.stt_whisperx.vad_offset,
             "local_files_only": settings.stt_whisperx.local_files_only,
         },
+        "stt_qwen": {
+            # SPEC §4：stage 默认值来自 [stt_qwen]（job_config 只能覆盖白名单内的键）。
+            **_stt_qwen_settings(settings).as_job_config(),
+            # 路径类键在装配期解析成绝对路径：执行器不去猜相对谁（cwd 会变），
+            # 也让 effective_config 里的路径可直接用于排障。
+            "model_dir": str(
+                _resolve_runtime_path(config_path, Path(settings.stt_qwen.model_dir))
+            ),
+            "aligner_dir": str(
+                _resolve_runtime_path(config_path, Path(settings.stt_qwen.aligner_dir))
+            ),
+            "vad_model_dir": str(
+                _resolve_runtime_path(
+                    config_path, Path(settings.stt_qwen.vad_model_dir)
+                )
+            ),
+        },
         "translate": {
             # SPEC C.2：stage 默认值来自 [translation]（job_config 仍可覆盖）。
             **_translation_settings(settings).as_job_config(),
         },
     }
+
+
+def _stt_qwen_settings(settings: Settings):
+    """读取 [stt_qwen] 解析结果；老 Settings 实例缺少该段时回退默认值。"""
+
+    from whisper_stt_service.core.config import SttQwenSettings
+
+    return getattr(settings, "stt_qwen", None) or SttQwenSettings()
 
 
 def _translation_settings(settings: Settings) -> TranslationSettings:
@@ -239,12 +264,14 @@ def build_app() -> FastAPI:
             "extract": settings.retry.extract_max_retries,
             "stt": settings.retry.stt_max_retries,
             "stt_whisperx": settings.retry.stt_whisperx_max_retries,
+            "stt_qwen": settings.retry.stt_qwen_max_retries,
             "translate": settings.retry.translate_max_retries,
         },
         stage_timeouts={
             "extract": settings.timeouts.extract_timeout_sec,
             "stt": settings.timeouts.stt_timeout_sec,
             "stt_whisperx": settings.timeouts.stt_whisperx_timeout_sec,
+            "stt_qwen": settings.timeouts.stt_qwen_timeout_sec,
             "translate": settings.timeouts.translate_timeout_sec,
         },
         stage_effective_defaults=_build_stage_effective_defaults(settings, config_path),
@@ -264,7 +291,7 @@ def build_app() -> FastAPI:
     if metrics_enabled:
         metrics = build_metrics(
             repo_factory=lambda: repo,
-            stages=("extract", "stt", "stt_whisperx", "translate"),
+            stages=("extract", "stt", "stt_whisperx", "stt_qwen", "translate"),
         )
 
     # D：模型缓存容量与并发上限（0 = 不缓存）；命中/未命中计入同一 MetricsState。
