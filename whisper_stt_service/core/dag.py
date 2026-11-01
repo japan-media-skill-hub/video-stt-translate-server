@@ -187,6 +187,8 @@ def _validate_stage_config_value(stage: str, key: str, value: object) -> None:
         ("translate", "timeout"): 1,
         # SPEC C.4：检查点保留秒数，允许 0（成功即清理）。
         ("translate", "progress_ttl_sec"): 0,
+        # 输出 token 上限：允许 0（表示不下发该字段，沿用上游默认）。
+        ("translate", "max_tokens"): 0,
     }
     float_min_rules: dict[tuple[str, str], float] = {
         ("stt", "patience"): 0.1,
@@ -211,6 +213,8 @@ def _validate_stage_config_value(stage: str, key: str, value: object) -> None:
         ("translate", "disable_proxy"),
         ("translate", "checkpoint_enabled"),
         ("translate", "strict_ids"),
+        # 是否允许模型思考（False = 请求体下发 reasoning.enabled=false）。
+        ("translate", "reasoning_enabled"),
     }
     str_rules = {
         ("stt", "device"),

@@ -398,6 +398,13 @@ def preclean_output(path: Path) -> None:
 
 DEFAULT_TRANSLATE_BATCH_SIZE = 200
 DEFAULT_TRANSLATE_MAX_CHARS = 12000
+# 单次请求的输出 token 上限：必须显式下发，否则上游默认上限会在"大批量 + 长译文"
+# 时把 JSON 截断，表现为 parse 错误后重试空转（2026-11-01 实测单批 200 条曾耗 303s 仍解析失败）。
+DEFAULT_TRANSLATE_MAX_TOKENS = 16000
+# 关思考：显式下发 reasoning.enabled=false。当前 OpenRouter + deepseek-v3.2 路由的
+# reasoning_tokens 恒为 0（推理写在正文），该参数对这类路由无可测收益；但对后续
+# 会走独立思考 token 的系列模型是必要开关，故默认关闭思考并保留配置。
+DEFAULT_TRANSLATE_REASONING_ENABLED = False
 
 
 @dataclass
@@ -794,6 +801,9 @@ class TranslateSettings:
     checkpoint_enabled: bool = True
     strict_ids: bool = False
     progress_ttl_sec: int = 604800
+    # 请求体透传：输出上限与是否允许思考（见上方常量说明）。
+    max_tokens: int = DEFAULT_TRANSLATE_MAX_TOKENS
+    reasoning_enabled: bool = DEFAULT_TRANSLATE_REASONING_ENABLED
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -912,6 +922,8 @@ def resolve_translate_settings(
         "checkpoint_enabled",
         "strict_ids",
         "progress_ttl_sec",
+        "max_tokens",
+        "reasoning_enabled",
     ):
         current = getattr(defaults, key)
         if isinstance(current, bool):
@@ -955,4 +967,6 @@ def resolve_translate_settings(
     resolved["retry"] = max(int(resolved["retry"]), 1)
     resolved["request_interval"] = max(float(resolved["request_interval"]), 0.0)
     resolved["progress_ttl_sec"] = max(int(resolved["progress_ttl_sec"]), 0)
+    # max_tokens=0 表示"不下发该字段"（沿用上游默认），负值同样归零。
+    resolved["max_tokens"] = max(int(resolved["max_tokens"]), 0)
     return TranslateSettings(**resolved)

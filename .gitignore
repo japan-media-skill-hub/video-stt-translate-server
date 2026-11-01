@@ -11,6 +11,8 @@ __pycache__/
 
 # Local output and media artifacts
 output/
+# 运行时产物目录：**完整排除**，不进版本库（含 tmp/research 原型、tmp/e2e* 运行目录、
+# tmp/logs 日志、SQLite 状态库、导出的 wav/srt 等）。工作区里可以随便写，git 永不跟踪。
 tmp/
 tests/e2e/video_paths.txt
 # 真实媒体用例已迁移到 tests/manual/test_real_media.py 并纳入版本跟踪，

@@ -340,6 +340,18 @@ def _parse_args() -> argparse.Namespace:
             "with full hardening; 'legacy' keeps the old standalone loop for debugging"
         ),
     )
+    # 任务级总 deadline（整批翻译的总时长），与 --timeout（单批 HTTP 超时）语义不同。
+    # 缺省取 [timeouts] translate_timeout_sec，避免长片被单批超时值误杀。
+    parser.add_argument(
+        "--deadline",
+        type=int,
+        default=None,
+        help=(
+            "Task-level deadline in seconds (defaults to [timeouts] "
+            "translate_timeout_sec). Distinct from --timeout, which is the "
+            "per-batch HTTP timeout."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -460,7 +472,16 @@ def _run_unified_engine(
     chunk_minutes = _cfg_int(
         args.chunk_minutes, config, "translation", "chunk_minutes", 30
     )
-    timeout = _cfg_int(args.timeout, config, "translation", "timeout", 180)
+    # 语义分离（P1 回归修复，2026-11-01）：
+    #   `[translation] timeout` = **单批 HTTP 超时**；
+    #   `[timeouts] translate_timeout_sec` = **任务级总 deadline**。
+    # 旧实现把前者同时传给 run_translate(timeout_sec=...)，导致超过 240s 的长片
+    # 被 TranslateCancelledError("translate_timeout") 误杀（ATID 606 行实测）。
+    http_timeout = _cfg_int(args.timeout, config, "translation", "timeout", 180)
+    # 用 getattr 兜住"直接构造 Namespace 的旧调用/测试"：缺失 --deadline 时按配置回退。
+    deadline = getattr(args, "deadline", None)
+    if deadline is None:
+        deadline = _cfg_int(None, config, "timeouts", "translate_timeout_sec", 7200)
     retry = _cfg_int(args.retry, config, "translation", "retry", 4)
     # D2：脚本模式默认并发同样为 2（仍可通过 --parallel 或 [translation] parallel 覆盖）。
     parallel = _cfg_int(args.parallel, config, "translation", "parallel", 2)
@@ -490,7 +511,10 @@ def _run_unified_engine(
         + " chunk_minutes=" + str(chunk_minutes)
         + " batch_size=" + str(batch_size)
         + " max_parallel=" + str(parallel)
-        + " retry=" + str(retry),
+        + " retry=" + str(retry)
+        # 两者语义不同，必须都打印，避免再次混淆：http_timeout 是单批，deadline 是总时长。
+        + " http_timeout=" + str(http_timeout)
+        + " deadline=" + str(deadline),
         flush=True,
     )
 
@@ -498,7 +522,9 @@ def _run_unified_engine(
         args.input,
         output_path,
         config_path=config_path,
-        timeout_sec=timeout,
+        # 任务级 deadline：来自 [timeouts] translate_timeout_sec（或 --deadline），
+        # 不再用 [translation] timeout（那是单批 HTTP 超时）。
+        timeout_sec=deadline,
         # CLI 没有视频上下文：由 defer_copy_back=True 显式关闭回写，避免污染任意目录。
         input_video_path=output_path.parent,
         defer_copy_back=True,
@@ -507,7 +533,8 @@ def _run_unified_engine(
             "parallel": parallel,
             "batch_size": batch_size,
             "chunk_minutes": chunk_minutes,
-            "timeout": timeout,
+            # job_config["timeout"] 只表达单批 HTTP 超时；任务级 deadline 由 timeout_sec 传。
+            "timeout": http_timeout,
             "retry": retry,
             "request_interval": request_interval,
             "disable_proxy": disable_proxy,

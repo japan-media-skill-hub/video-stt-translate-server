@@ -2273,3 +2273,73 @@ def test_real_api_dict_contract_one_extra_key_is_reported_not_silently_dropped(
     assert translations[85] == "zh-85"
     # 多出来的 108 绝不能被写进任何字幕行。
     assert "多出来的一条" not in output.read_text(encoding="utf-8")
+
+
+def test_call_translate_api_sends_max_tokens_and_reasoning_switch() -> None:
+    """请求体必须能下发输出上限与"关思考"开关；0/None 时不下发（保持旧行为）。
+
+    背景（2026-11-01）：未下发 `max_tokens` 时，上游默认输出上限会把"大批量+长译文"
+    的 JSON 截断，表现为 parse 错误后重试空转（实测单批 200 条曾耗 303s 仍失败）。
+    """
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({"1": "你好"})}}]}
+
+    def post(url: str, **kwargs):
+        captured.clear()
+        captured.update(kwargs.get("json") or {})
+        return _Resp()
+
+    batch = [
+        SrtEntry(index=1, timestamp="00:00:00,000 --> 00:00:01,000", text="こんにちは")
+    ]
+
+    _call_translate_api(
+        post,
+        base_url="https://x/v1",
+        api_key="k",
+        model="m",
+        timeout_sec=30,
+        batch=batch,
+        max_tokens=16000,
+        reasoning_enabled=False,
+    )
+    assert captured["max_tokens"] == 16000
+    assert captured["reasoning"] == {"enabled": False}
+
+    # 0/None 表示不下发：兼容不接受这两个字段的供应商，也与旧行为一致。
+    _call_translate_api(
+        post,
+        base_url="https://x/v1",
+        api_key="k",
+        model="m",
+        timeout_sec=30,
+        batch=batch,
+        max_tokens=0,
+        reasoning_enabled=None,
+    )
+    assert "max_tokens" not in captured
+    assert "reasoning" not in captured
+
+
+def test_translate_settings_reads_max_tokens_and_reasoning_from_config() -> None:
+    """`[translation]` 的 max_tokens / reasoning_enabled 必须能解析进 settings。"""
+
+    cfg = configparser.ConfigParser()
+    cfg.read_string("[translation]\nmax_tokens = 8000\nreasoning_enabled = true\n")
+    settings = resolve_translate_settings(cfg, None)
+    assert settings.max_tokens == 8000
+    assert settings.reasoning_enabled is True
+
+    # 缺省取代码默认：16000 + 关思考。
+    default_settings = resolve_translate_settings(configparser.ConfigParser(), None)
+    assert default_settings.max_tokens == 16000
+    assert default_settings.reasoning_enabled is False

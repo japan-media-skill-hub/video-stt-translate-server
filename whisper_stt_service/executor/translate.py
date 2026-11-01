@@ -256,12 +256,21 @@ def _call_translate_api(
     timeout_sec: int,
     batch: list[SrtEntry],
     idempotency_key: str | None = None,
+    max_tokens: int | None = None,
+    reasoning_enabled: bool | None = None,
 ) -> dict[int, str]:
     """调用 LLM 翻译单个批次并返回 id -> 中文文本映射。
 
     返回项按 id 子集接受（仅接受本批出现的 id）；缺失或越界 id 抛
     `TranslatePartialIdsError`，由调用方决定重试或降级保留原文。
     传入 `idempotency_key` 时附加 `Idempotency-Key` 头，便于上游去重计费。
+
+    `max_tokens`：单次输出上限。必须显式下发，否则上游默认上限会把
+    "大批量 + 长译文"的 JSON 截断，表现为 parse 错误后重试空转
+    （2026-11-01 实测：单批 200 条曾耗时 303s 仍解析失败）。
+    `reasoning_enabled`：是否允许模型思考；False 时显式下发
+    `reasoning.enabled=false`（对会把推理写进正文的路由无可测收益，
+    但对独立思考 token 的模型系列是必要开关）。
     """
 
     messages = _build_translate_messages(batch)
@@ -271,14 +280,20 @@ def _call_translate_api(
     }
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
+    # 请求体保持最小面：仅在显式配置时追加可选字段，避免影响不接受该参数的供应商。
+    payload: dict[str, object] = {
+        "model": model,
+        "temperature": 0.2,
+        "messages": messages,
+    }
+    if max_tokens is not None and int(max_tokens) > 0:
+        payload["max_tokens"] = int(max_tokens)
+    if reasoning_enabled is not None:
+        payload["reasoning"] = {"enabled": bool(reasoning_enabled)}
     response = post_func(
         f"{base_url.rstrip('/')}/chat/completions",
         headers=headers,
-        json={
-            "model": model,
-            "temperature": 0.2,
-            "messages": messages,
-        },
+        json=payload,
         timeout=timeout_sec,
     )
     response.raise_for_status()
@@ -1205,6 +1220,9 @@ class _TranslateRunner:
                 timeout_sec=request_timeout,
                 batch=batch_entries,
                 idempotency_key=idempotency_key,
+                # 输出上限与思考开关随 settings 下发（job_config > [translation] > 默认值）
+                max_tokens=self.settings.max_tokens,
+                reasoning_enabled=self.settings.reasoning_enabled,
             )
         finally:
             with self._lock:

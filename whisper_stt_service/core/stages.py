@@ -63,5 +63,9 @@ STAGE_CONFIG_KEYS: dict[str, tuple[str, ...]] = {
         # 检查点（.progress.json）在任务成功后的保留秒数，0 表示立即清理。
         "progress_ttl_sec",
         "strict_ids",
+        # 单次请求的输出 token 上限（0 = 不下发，沿用上游默认）。
+        "max_tokens",
+        # 是否允许模型思考；False 时请求体下发 reasoning.enabled=false。
+        "reasoning_enabled",
     ),
 }
