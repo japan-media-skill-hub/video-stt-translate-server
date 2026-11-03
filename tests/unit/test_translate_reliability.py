@@ -2351,10 +2351,10 @@ def test_shipped_config_example_matches_code_defaults() -> None:
 
 
 def test_shipped_config_values_reach_the_request_body() -> None:
-    """配置 → settings → 请求体 全链路：50 条/批、max_tokens=20000、仍下发关思考。
+    """配置 → settings → 请求体 全链路：75 条/批、max_tokens=30000、仍下发关思考。
 
     这条补的是"改了配置但没真正生效"的盲区：只断言 settings 不够，必须看到
-    `json` 里真的带 `max_tokens: 20000` 与 `reasoning: {"enabled": false}`。
+    `json` 里真的带 `max_tokens: 30000` 与 `reasoning: {"enabled": false}`。
     """
 
     example = Path(__file__).resolve().parents[2] / "config.example.ini"
@@ -2395,7 +2395,7 @@ def test_shipped_config_values_reach_the_request_body() -> None:
         max_tokens=settings.max_tokens,
         reasoning_enabled=settings.reasoning_enabled,
     )
-    assert captured["max_tokens"] == 20000
+    assert captured["max_tokens"] == 30000
     assert captured["reasoning"] == {"enabled": False}
 
 
@@ -2408,8 +2408,136 @@ def test_translate_settings_reads_max_tokens_and_reasoning_from_config() -> None
     assert settings.max_tokens == 8000
     assert settings.reasoning_enabled is True
 
-    # 缺省取代码默认：16000 + 关思考。
+    # 缺省取代码默认：默认上限 + 关思考。
     default_settings = resolve_translate_settings(configparser.ConfigParser(), None)
-    # 2026-11-01 验收后默认上限 16000 → 20000（该路由的思考 token 计入 completion）。
-    assert default_settings.max_tokens == 20000
+    # 16000 → 20000 → 30000（2026-11-03：思考型模型单批 completion 可到 1.7 万，
+    # 上限必须留够"思考 + 正文"；配合 reasoning_effort=off 后实际只用 ~800）。
+    assert default_settings.max_tokens == DEFAULT_TRANSLATE_MAX_TOKENS
     assert default_settings.reasoning_enabled is False
+
+
+def test_call_translate_api_sends_reasoning_effort_and_extra_headers() -> None:
+    """关思考的第二条通道与段级附加头都必须能下发，缺省时都不能出现。
+
+    背景（2026-11-03 实测）：commandcode 的 DeepSeek flash 系列只认
+    `reasoning_effort="off"`（下发后思考 token 归零），`reasoning.enabled=false`
+    对它无效；opencode-go 网关则必须有 `x-opencode-session` 才能路由。
+    两者都是"配置了才下发"，不能默认出现，否则会污染只认旧字段的供应商。
+    """
+
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": json.dumps({"1": "你好"})}}]}
+
+    def post(url: str, **kwargs):
+        captured.clear()
+        captured.update(kwargs.get("json") or {})
+        captured["_headers"] = dict(kwargs.get("headers") or {})
+        return _Resp()
+
+    batch = [
+        SrtEntry(index=1, timestamp="00:00:00,000 --> 00:00:01,000", text="こんにちは")
+    ]
+
+    _call_translate_api(
+        post,
+        base_url="https://x/v1",
+        api_key="k",
+        model="m",
+        timeout_sec=30,
+        batch=batch,
+        reasoning_enabled=False,
+        reasoning_effort="off",
+        extra_headers={"x-opencode-session": "s-1"},
+    )
+    # 两条关思考通道同时下发，互不冲突；附加头必须出现在请求头里。
+    assert captured["reasoning"] == {"enabled": False}
+    assert captured["reasoning_effort"] == "off"
+    assert captured["_headers"]["x-opencode-session"] == "s-1"
+
+    # 缺省（空/None）时都不下发，保持旧行为。
+    _call_translate_api(
+        post,
+        base_url="https://x/v1",
+        api_key="k",
+        model="m",
+        timeout_sec=30,
+        batch=batch,
+        reasoning_enabled=None,
+        reasoning_effort="",
+        extra_headers=None,
+    )
+    assert "reasoning" not in captured
+    assert "reasoning_effort" not in captured
+    assert "x-opencode-session" not in captured["_headers"]
+
+
+def test_resolve_translate_settings_reasoning_effort_whitelist() -> None:
+    """`reasoning_effort` 只接受已知枚举，其余按"不下发"处理（拼错不等于允许思考）。"""
+
+    config = configparser.ConfigParser()
+    config.read_string("[translation]\nreasoning_effort = OFF\n")
+    settings = resolve_translate_settings(config, None)
+    assert settings.reasoning_effort == "off"  # 大小写归一
+
+    config.read_string("[translation]\nreasoning_effort = turbo\n")
+    assert resolve_translate_settings(config, None).reasoning_effort == ""
+
+    assert resolve_translate_settings(configparser.ConfigParser(), None).reasoning_effort == ""
+
+
+def test_load_llm_profiles_parses_extra_headers_and_per_section_effort() -> None:
+    """段级 `extra_headers` 与 `reasoning_effort` 覆盖必须按段解析。
+
+    背景（2026-11-03 实测）：commandcode 认 `reasoning_effort=off`（思考归零），
+    而 opencode-go 对同一字段返回 400 invalid_reasoning_effort、但只要带上
+    `x-opencode-session` 就能正常路由。所以"关思考参数"和"附加头"都必须能按
+    模型段落分别配置，且**未替该段配置时**要返回 None（= 沿用全局值）。
+    """
+
+    config = configparser.ConfigParser()
+    config.read_string(
+        """
+[llm]
+base_url = https://cc/v1
+api_key = k1
+model = m1
+
+[llm_fallback]
+base_url = https://og/v1
+api_key = k2
+model = m2
+reasoning_effort =
+extra_headers = {"x-opencode-session": "s-2", "X-Trace": "t"}
+"""
+    )
+
+    profiles = _load_llm_profiles(config)
+    assert [p["section"] for p in profiles] == ["llm", "llm_fallback"]
+
+    primary, fallback = profiles
+    # 主段没写 reasoning_effort → None（调用方回落到 [translation] 全局值）
+    assert primary["reasoning_effort"] is None
+    assert primary["extra_headers"] == {}
+    # 回退段显式置空 + 带附加头
+    assert fallback["reasoning_effort"] == ""
+    assert fallback["extra_headers"] == {"x-opencode-session": "s-2", "X-Trace": "t"}
+
+    # 写坏的 JSON 不能让整条链路失败：按"没有附加头"处理。
+    config.read_string(
+        """
+[llm]
+base_url = https://cc/v1
+api_key = k1
+model = m1
+extra_headers = not-json
+"""
+    )
+    assert _load_llm_profiles(config)[0]["extra_headers"] == {}

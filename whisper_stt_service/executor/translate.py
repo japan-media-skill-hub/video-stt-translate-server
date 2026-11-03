@@ -69,11 +69,36 @@ def _load_llm_profiles(
     profiles: list[dict[str, str]] = []
 
     def _append_profile(section: str) -> None:
-        """把某个配置段作为候选 LLM；base_url/api_key/model 任一缺失即跳过。"""
+        """把某个配置段作为候选 LLM；base_url/api_key/model 任一缺失即跳过。
+
+        `extra_headers`（可选，JSON 对象字符串）用于补网关要求的附加请求头：
+        opencode-go 少了 `x-opencode-session` 会直接 400 MissingSessionID，
+        而服务只发 Authorization/Content-Type。解析失败按"没有附加头"处理，
+        不让一个写错的配置项把整条翻译链路打死。
+        """
 
         base_url = config.get(section, "base_url", fallback="").strip()
         api_key = config.get(section, "api_key", fallback="").strip()
         model = config.get(section, "model", fallback="").strip()
+        raw_headers = config.get(section, "extra_headers", fallback="").strip()
+        # 段级 reasoning_effort 覆盖：填了就按它（空值=该段不下发），没填就沿用
+        # [translation] 的全局值。为什么必须能分段：commandcode 认 reasoning_effort
+        # 而 opencode-go 直接 400 invalid_reasoning_effort（2026-11-03 实测），
+        # 一条链路上主/备供应商对同一字段的接受度可以相反。
+        if config.has_option(section, "reasoning_effort"):
+            raw_effort: str | None = config.get(section, "reasoning_effort", fallback="").strip().lower()
+        else:
+            raw_effort = None
+        extra_headers: dict[str, str] = {}
+        if raw_headers:
+            try:
+                parsed_headers = json.loads(raw_headers)
+                if isinstance(parsed_headers, dict):
+                    extra_headers = {
+                        str(k): str(v) for k, v in parsed_headers.items() if str(k).strip()
+                    }
+            except (ValueError, TypeError):
+                extra_headers = {}
         if section == "llm" and safe_overrides:
             # 命令行覆盖只作用于主配置段，优先级高于 config.ini。
             base_url = safe_overrides.get("base_url", base_url)
@@ -87,6 +112,8 @@ def _load_llm_profiles(
                 "base_url": base_url,
                 "api_key": api_key,
                 "model": model,
+                "extra_headers": extra_headers,
+                "reasoning_effort": raw_effort,
             }
         )
 
@@ -258,6 +285,8 @@ def _call_translate_api(
     idempotency_key: str | None = None,
     max_tokens: int | None = None,
     reasoning_enabled: bool | None = None,
+    reasoning_effort: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[int, str]:
     """调用 LLM 翻译单个批次并返回 id -> 中文文本映射。
 
@@ -271,6 +300,12 @@ def _call_translate_api(
     `reasoning_enabled`：是否允许模型思考；False 时显式下发
     `reasoning.enabled=false`（对会把推理写进正文的路由无可测收益，
     但对独立思考 token 的模型系列是必要开关）。
+    `reasoning_effort`：关思考的**第二条通道**。2026-11-03 实测 commandcode 的
+    DeepSeek flash 系列只认 `reasoning_effort="off"`（下发后思考 token 归零：
+    v4.1-flash 9.4s/798 token），而 `reasoning.enabled=false` 对它无效（仍烧约 1 万
+    token）。两条都下发互不冲突：认 A 的网关忽略 B，认 B 的忽略 A。空值不下发。
+    `extra_headers`：按模型段落配置的附加请求头（例如 opencode-go 网关必需的
+    `x-opencode-session`），无则不加。
     """
 
     messages = _build_translate_messages(batch)
@@ -280,6 +315,8 @@ def _call_translate_api(
     }
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
+    if extra_headers:
+        headers.update({str(k): str(v) for k, v in extra_headers.items()})
     # 请求体保持最小面：仅在显式配置时追加可选字段，避免影响不接受该参数的供应商。
     payload: dict[str, object] = {
         "model": model,
@@ -290,6 +327,8 @@ def _call_translate_api(
         payload["max_tokens"] = int(max_tokens)
     if reasoning_enabled is not None:
         payload["reasoning"] = {"enabled": bool(reasoning_enabled)}
+    if reasoning_effort:
+        payload["reasoning_effort"] = str(reasoning_effort)
     response = post_func(
         f"{base_url.rstrip('/')}/chat/completions",
         headers=headers,
@@ -1223,6 +1262,15 @@ class _TranslateRunner:
                 # 输出上限与思考开关随 settings 下发（job_config > [translation] > 默认值）
                 max_tokens=self.settings.max_tokens,
                 reasoning_enabled=self.settings.reasoning_enabled,
+                # 关思考的第二条通道（commandcode 只认这个）；空值不下发。
+                # 段级覆盖优先：og 不认该字段（400），所以回退段显式配空。
+                reasoning_effort=(
+                    llm_profile["reasoning_effort"]
+                    if llm_profile.get("reasoning_effort") is not None
+                    else self.settings.reasoning_effort
+                ),
+                # 段级附加头（opencode-go 需要 x-opencode-session），无则不加。
+                extra_headers=llm_profile.get("extra_headers"),
             )
         finally:
             with self._lock:

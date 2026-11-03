@@ -396,22 +396,30 @@ def preclean_output(path: Path) -> None:
     # 清理失败不应阻断后续流程，让 ffmpeg 自行报告可复现错误。
 
 
-# 单批条目数默认值（2026-11-01 验收后 200 → 50）：批次越大，单批 completion 越高、
-# 越容易撞上游输出上限被截断，表现为 parse 错误后重试空转。
-# 实测：100 条 completion 13773–22974 且 finish_reason=error；25 条 16.6s 稳定成功。
-DEFAULT_TRANSLATE_BATCH_SIZE = 50
+# 单批条目数默认值（200 → 50 → **75**）：批次越大，单批 completion 越高、越容易撞
+# 上游输出上限被截断。历史实测：100 条 completion 13773–22974 且 finish_reason=error；
+# 25 条 16.6s 稳定；50 → 75 是在"关掉思考 + max_tokens=30000"前提下的当前口径
+# （2026-11-03 全量跑片 25 部、单批 9–16s 完成），换回思考型模型时须重新标定。
+DEFAULT_TRANSLATE_BATCH_SIZE = 75
 DEFAULT_TRANSLATE_MAX_CHARS = 12000
 # 单次请求的输出 token 上限：必须显式下发，否则上游默认上限会在"大批量 + 长译文"
 # 时把 JSON 截断，表现为 parse 错误后重试空转（2026-11-01 实测单批 200 条曾耗 303s 仍解析失败）。
 # （2026-11-01 验收后 16000 → 20000：该路由的思考 token 计入 completion，
 # 上限必须留够"思考 + 正文"的总量。）
-DEFAULT_TRANSLATE_MAX_TOKENS = 20000
+DEFAULT_TRANSLATE_MAX_TOKENS = 30000
 # 关思考：仍显式下发 reasoning.enabled=false（用户决定保留）。
 # **旧结论已更正**：这里原先写"reasoning_tokens 恒为 0、无可测收益"，但 2026-11-01
 # 验收单变量对照实测为：enabled=false 仍产生 7185 个 reasoning token（不传 12676、
 # effort=low 6148、max_tokens=0 5732）——该路由把参数当提示而非开关，**只减不关**。
 # 因此思考开销必须按"不可避免"来设计超时与批次；要真正不思考只能换路由/换模型。
 DEFAULT_TRANSLATE_REASONING_ENABLED = False
+# 关思考的第二条通道：OpenAI 风格的 `reasoning_effort`（off|low|medium|high|xhigh）。
+# 2026-11-03 实测（同一 75 行批次、同提示词）：
+#   commandcode 的 deepseek-v4-flash / v4.1-flash **只有** `reasoning_effort="off"` 才真关思考
+#   （v4.1-flash：9.4s / 798 token / **思考 0**；只发 reasoning.enabled=false 时仍烧约 1 万 token）；
+#   opencode-go 上该参数**无效**（v4.1-flash 仍 11466 思考 token），那边只能挑天然不思考的模型。
+# 空字符串 = 不下发该字段（兼容不认识它的供应商，也与旧行为一致）。
+DEFAULT_TRANSLATE_REASONING_EFFORT = ""
 
 
 @dataclass
@@ -811,6 +819,8 @@ class TranslateSettings:
     # 请求体透传：输出上限与是否允许思考（见上方常量说明）。
     max_tokens: int = DEFAULT_TRANSLATE_MAX_TOKENS
     reasoning_enabled: bool = DEFAULT_TRANSLATE_REASONING_ENABLED
+    # 关思考的第二条通道；空字符串表示不下发该字段。
+    reasoning_effort: str = DEFAULT_TRANSLATE_REASONING_EFFORT
 
 
 def _coerce_bool(value: Any, default: bool) -> bool:
@@ -931,6 +941,7 @@ def resolve_translate_settings(
         "progress_ttl_sec",
         "max_tokens",
         "reasoning_enabled",
+        "reasoning_effort",
     ):
         current = getattr(defaults, key)
         if isinstance(current, bool):
@@ -976,4 +987,8 @@ def resolve_translate_settings(
     resolved["progress_ttl_sec"] = max(int(resolved["progress_ttl_sec"]), 0)
     # max_tokens=0 表示"不下发该字段"（沿用上游默认），负值同样归零。
     resolved["max_tokens"] = max(int(resolved["max_tokens"]), 0)
+    # reasoning_effort 空串 = 不下发；只接受已知枚举，其余按"不下发"处理（fail-safe：
+    # 拼错的值不会被当成"允许思考"，也不会把 request 弄脏）。
+    effort = str(resolved.get("reasoning_effort") or "").strip().lower()
+    resolved["reasoning_effort"] = effort if effort in {"off", "low", "medium", "high", "xhigh"} else ""
     return TranslateSettings(**resolved)

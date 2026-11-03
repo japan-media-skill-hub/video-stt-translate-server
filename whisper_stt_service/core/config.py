@@ -226,12 +226,14 @@ class TranslationSettings:
     """
 
     parallel: int = 2
-    # 2026-11-01 验收后 200 → 50（与 executor/common.DEFAULT_TRANSLATE_BATCH_SIZE 同一口径）。
-    batch_size: int = 50
+    # 200 → 50 → 75（与 executor/common.DEFAULT_TRANSLATE_BATCH_SIZE 同一口径；
+    # 2026-11-03 起配合"关思考 + max_tokens=30000"，单批 9–16s）。
+    batch_size: int = 75
     max_chars: int = 12000
     chunk_minutes: int = 20
     timeout_sec: int = 240
-    retry: int = 10
+    # 批次重试次数：10 → 3（主模型 attempt=1、回退模型 attempt≥2，见 _pick_llm_profile）。
+    retry: int = 3
     request_interval: float = 1.0
     disable_proxy: bool = True
     copy_back: str = "__video_dir__"
